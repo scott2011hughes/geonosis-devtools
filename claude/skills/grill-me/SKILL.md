@@ -8,3 +8,27 @@ Interview me relentlessly about every aspect of this plan until we reach a share
 Ask the questions one at a time.
 
 If a question can be answered by exploring the codebase, explore the codebase instead.
+
+When there are no remaining open questions, output a single JSON block and nothing else:
+
+```json
+{
+  "feature": "",
+  "context": {
+    "repo": "",
+    "services": [],
+    "likely_files": []
+  },
+  "problem_statement": "",
+  "solution": "",
+  "user_stories": [],
+  "implementation_decisions": [],
+  "testing_decisions": [],
+  "constraints": [],
+  "out_of_scope": [],
+  "definition_of_done": [],
+  "open_questions": []
+}
+```
+
+open_questions must be empty before outputting. If any remain, keep interviewing.

@@ -1,0 +1,13 @@
+{
+  "models": {
+    "builder": "claude-sonnet-4-6",
+    "inspector": "claude-haiku-4-5-20251001"
+  },
+  "max_iterations": 3,
+  "repo_root": "{repo_root}",
+  "agent_dir": "{repo_root}/.claude/agents",
+  "log_dir": "{repo_root}/.claude/factory/logs",
+  "playwright_dir": "~/my_claude_automations/playwright",
+  "healthcheck_script": "~/my_claude_automations/healthcheck.sh",
+  "vscode_diff_script": "{repo_root}/.claude/hooks/vscode-diff.sh"
+}

@@ -1,74 +1,63 @@
 ---
 name: write-a-prd
-description: Create a PRD through user interview, codebase exploration, and module design, then submit as a GitHub issue. Use when user wants to write a PRD, create a product requirements document, or plan a new feature.
+description: Create a PRD from a grill-me JSON handoff or a solid existing spec. Explores codebase, designs deep modules, submits as GitHub issue. Use when user wants to write a PRD, create a product requirements document, or plan a new feature.
 ---
 
-This skill will be invoked when the user wants to create a PRD. You may skip steps if you don't consider them necessary.
+You will receive either a grill-me JSON block or a raw feature description.
 
-1. Ask the user for a long, detailed description of the problem they want to solve and any potential ideas for solutions.
+If given raw text with no JSON, invoke grill-me first.
 
-2. Explore the repo to verify their assertions and understand the current state of the codebase.
+## Steps
 
-3. Interview the user relentlessly about every aspect of this plan until you reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one.
+1. Parse the input. If open_questions is non-empty, stop and resolve them with the user before continuing.
 
-4. Sketch out the major modules you will need to build or modify to complete the implementation. Actively look for opportunities to extract deep modules that can be tested in isolation.
+2. Explore the repo to verify assertions and understand current state. Look for prior art for testing patterns.
 
-A deep module (as opposed to a shallow module) is one which encapsulates a lot of functionality in a simple, testable interface which rarely changes.
+3. Sketch major modules to build or modify. Actively look for deep modules — ones that encapsulate significant functionality behind a simple, stable, testable interface. Confirm with user which modules need tests.
 
-Check with the user that these modules match their expectations. Check with the user which modules they want tests written for.
+4. Write the PRD using the template below and submit as a GitHub issue.
 
-5. Once you have a complete understanding of the problem and solution, use the template below to write the PRD. The PRD should be submitted as a GitHub issue.
+## PRD Template
 
-<prd-template>
+### Problem Statement
+The problem from the user's perspective.
 
-## Problem Statement
+### Solution
+The solution from the user's perspective.
 
-The problem that the user is facing, from the user's perspective.
+### User Stories
+Numbered, extensive, behavioral. Format:
+1. As a <actor>, I want <feature>, so that <benefit>
 
-## Solution
-
-The solution to the problem, from the user's perspective.
-
-## User Stories
-
-A LONG, numbered list of user stories. Each user story should be in the format of:
-
-1. As an <actor>, I want a <feature>, so that <benefit>
-
-<user-story-example>
-1. As a mobile bank customer, I want to see balance on my accounts, so that I can make better informed decisions about my spending
-</user-story-example>
-
-This list of user stories should be extremely extensive and cover all aspects of the feature.
-
-## Implementation Decisions
-
-A list of implementation decisions that were made. This can include:
-
-- The modules that will be built/modified
-- The interfaces of those modules that will be modified
-- Technical clarifications from the developer
+### Implementation Decisions
+- Modules built/modified
+- Interface changes
 - Architectural decisions
 - Schema changes
 - API contracts
 - Specific interactions
 
-Do NOT include specific file paths or code snippets. They may end up being outdated very quickly.
+No file paths or code snippets — these go stale.
 
-## Testing Decisions
+### Testing Decisions
+- What makes a good test for this feature (external behavior only)
+- Which modules get tests
+- Prior art in codebase
 
-A list of testing decisions that were made. Include:
+### Constraints
+HIPAA, security, performance, API contracts, rate limits — anything the coder must not violate.
 
-- A description of what makes a good test (only test external behavior, not implementation details)
-- Which modules will be tested
-- Prior art for the tests (i.e. similar types of tests in the codebase)
+### Out of Scope
+Explicit. What this PR does NOT do.
 
-## Out of Scope
+### Definition of Done
+- [ ] All user stories have passing tests
+- [ ] No regressions in affected areas
+- [ ] Open Questions empty
+- [ ] Deployed to target env
 
-A description of the things that are out of scope for this PRD.
+### Open Questions
+Must be empty before handoff to orchestrator.
 
-## Further Notes
-
-Any further notes about the feature.
-
-</prd-template>
+### Further Notes
+Anything else relevant.
