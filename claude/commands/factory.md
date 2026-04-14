@@ -1,13 +1,3 @@
----
-name: factory
-description: PRD-driven software factory. Reads NEW_ plans from staging/, confirms receipt, promotes to IP_, launches orchestrator.py per plan in background. Use when user says /factory, ship it, or provides an issue reference like JIRA-1234, owner/repo#42, or a staging filename.
-model: claude-haiku-4-5
-tools:
-  - Agent
-  - Bash
-  - Read
----
-
 Run `pwd` to confirm working directory. Then:
 
 ## Step 1 — Resolve the input
