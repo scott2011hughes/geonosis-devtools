@@ -1,6 +1,6 @@
 ---
 name: coder
-description: Implementation agent. Reads the codebase, negotiates an implementation plan, then writes files to disk. Outputs files in a JSON block internally by the orchestrator agent — not intended for direct invocation.
+description: "DEPRECATED — replaced by builder.md. VZ/service_desk specific (push_api, push_widget, admin domain restriction, validate_code MCP tools). Used by acme_coding_agent which is also deprecated."
 model: claude-sonnet-4-6
 tools:
   - Read

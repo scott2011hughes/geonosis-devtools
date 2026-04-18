@@ -728,6 +728,9 @@ def phase_implement(client, config, eec, agreed_plan, feedback, scope_type,
             dest.write_text(content)
             written_files.append(rel_path)
 
+    # Deploy services affected by written files (reads from EEC — no-op if unconfigured)
+    phase_deploy(written_files, eec, cwd, pid, log_dir)
+
     sidecar.update({
         "phase": f"IMPLEMENT_{iteration}_DONE",
         "iteration": iteration,
@@ -736,6 +739,44 @@ def phase_implement(client, config, eec, agreed_plan, feedback, scope_type,
     write_sidecar(plan, sidecar)
     phase_done(pid, log_dir, "4/8", f"{len(written_files)} files written")
     return written_files
+
+
+def phase_deploy(written_files: list, eec: dict, cwd: Path, pid: int, log_dir: Path):
+    """
+    Run make deploy targets for services affected by written files.
+    Reads service paths and deploy targets from eec.execution.services.
+    No-ops if EEC has no services or Makefile is absent.
+    """
+    services = eec.get("execution", {}).get("services", {})
+    deploy_cmd = eec.get("execution", {}).get("deploy_command", "make")
+    if not services or not written_files:
+        return
+
+    makefile = cwd / "Makefile"
+    if not makefile.exists():
+        log(log_dir, "No Makefile found — skipping deploy")
+        return
+
+    targets: set[str] = set()
+    for rel_path in written_files:
+        for _svc_name, svc_cfg in services.items():
+            svc_path = svc_cfg.get("path", "")
+            if svc_path and rel_path.startswith(svc_path):
+                for t in svc_cfg.get("deploy_target", "").split():
+                    targets.add(t)
+
+    if not targets:
+        return
+
+    target_str = " ".join(sorted(targets))
+    log(log_dir, f"Deploy: {deploy_cmd} -C {cwd} {target_str}")
+    print(f"\033[1;33m▶  DEPLOY  —  {target_str}\033[0m")
+    result = subprocess.run(
+        f"{deploy_cmd} -C {cwd} {target_str}".split(),
+        capture_output=False,
+    )
+    if result.returncode != 0:
+        log(log_dir, f"Deploy returned exit {result.returncode} — continuing")
 
 
 def phase_preflight(config, pid, log_dir, sidecar, plan):

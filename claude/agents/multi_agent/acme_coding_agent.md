@@ -1,6 +1,6 @@
 ---
 name: acme_coding_agent
-description: Multi-agent coding orchestrator. Negotiates an implementation plan with the coder, privately creates a test plan with QA, drives the implement→test→feedback loop (up to 5 iterations), then commits and delivers. Invoke with a natural-language feature request. Example: "Add a users search endpoint that filters by name and email"
+description: "DEPRECATED — replaced by factory agent + orchestrator.py. VZ/service_desk specific (hardcoded service paths, MCP tools, deploy targets). Use @factory with vz_eec.json instead. Retained until factory is validated on VZ."
 model: claude-opus-4-6
 tools:
   - Agent

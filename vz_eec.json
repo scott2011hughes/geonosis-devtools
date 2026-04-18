@@ -1,0 +1,128 @@
+{
+  "_readme": "Execution Environment Contract for the VZ service_desk repo. Place at the service_desk repo root.",
+  "repo": "service_desk",
+  "maturity": "established",
+
+  "paths": {
+    "app_root": "services/",
+    "tests_root": "services/shared/tests/",
+    "test_tiers": {
+      "unit": "services/shared/tests/unit/",
+      "integration": "services/shared/tests/integration/",
+      "e2e": "playwright/"
+    }
+  },
+
+  "imports": {
+    "allowed_roots": ["services", "shared"],
+    "forbidden_import_roots": ["services.shared"],
+    "forbid_relative_traversal": true,
+    "forbidden_module_level": [
+      "shared.resources.deploy",
+      "shared.resources.mongodb",
+      "shared.resources.config",
+      "shared.resources.task"
+    ],
+    "stdlib_passthrough": true,
+    "third_party_passthrough": true
+  },
+
+  "canonical_entry_points": {
+    "mongodb": {
+      "use": "from shared.resources.mongodb import get_mongodb",
+      "forbidden_imports": ["pymongo.MongoClient", "pymongo"],
+      "reason": "get_mongodb() handles connection pooling and vault credential resolution — direct pymongo breaks test environments"
+    },
+    "config": {
+      "use": "from shared.resources.config import config",
+      "forbidden_imports": ["hvac"],
+      "reason": "config.py detects env and routes to vault or env vars — direct vault access breaks tests"
+    }
+  },
+
+  "filesystem": {
+    "allowed_write": ["services/"],
+    "forbidden_write": [
+      "pytest.ini",
+      "pyproject.toml",
+      "setup.cfg",
+      "conftest.py"
+    ]
+  },
+
+  "scaffold_policy": {
+    "qa_can_request": true,
+    "requires_user_approval": true,
+    "must_match_test_tiers": true
+  },
+
+  "conftest_policy": {
+    "root_immutable": true,
+    "domain_conftest_requires_approval": true,
+    "local_fixtures_preferred": true
+  },
+
+  "execution": {
+    "test_command": ["pytest", "--tb=short", "-v"],
+    "services": {
+      "api": {
+        "path": "services/api/",
+        "deploy_target": "deploy-local-api"
+      },
+      "api_private": {
+        "path": "services/api_private/",
+        "deploy_target": "deploy-local-api-private"
+      },
+      "ui": {
+        "path": "services/ui/",
+        "deploy_target": "deploy-local-ui"
+      },
+      "worker_cpu": {
+        "path": "services/worker_cpu/",
+        "deploy_target": "deploy-local-worker-cpu"
+      },
+      "worker": {
+        "path": "services/worker/",
+        "deploy_target": "deploy-local-worker"
+      },
+      "scheduler": {
+        "path": "services/scheduler/",
+        "deploy_target": "deploy-local-scheduler"
+      },
+      "shared": {
+        "path": "services/shared/",
+        "deploy_target": "deploy-local-api deploy-local-api-private deploy-local-worker deploy-local-worker-cpu deploy-local-scheduler",
+        "_note": "shared touches all services — deploying it triggers all targets"
+      }
+    },
+    "deploy_command": "make -j",
+    "playwright": {
+      "dir": "~/my_claude_automations/playwright",
+      "widget_fixture": "widgetFrame",
+      "target_url": "https://servicedesk.ebiz.verizon.com/portal/",
+      "skills_references": "/opt/apps/service_desk/.claude/skills/playwright-cli/references/"
+    },
+    "mcp_tools": {
+      "push_api":     { "allowed": true, "forbidden_domains": ["admin"] },
+      "push_widget":  { "allowed": true, "forbidden_domains": ["admin"] },
+      "pull_api":     { "allowed": true },
+      "pull_widget":  { "allowed": true },
+      "test_api":     { "allowed": true },
+      "validate_code":{ "required_before_push": true },
+      "delete_api":   { "allowed": true, "forbidden_domains": ["admin"] },
+      "delete_widget":{ "allowed": true, "forbidden_domains": ["admin"] },
+      "_note": "admin domain contains platform infrastructure — reads allowed, writes must be escalated"
+    },
+    "feature_tag_prefixes": ["dcrm-decom", "talosflux"],
+    "healthcheck_script": "~/my_claude_automations/healthcheck.sh"
+  },
+
+  "rules": {
+    "tests_are_oracle": true,
+    "tests_not_editable": true,
+    "no_path_invention": true,
+    "validate_code_before_push": true
+  },
+
+  "scope_hint": null
+}

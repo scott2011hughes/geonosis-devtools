@@ -1,6 +1,6 @@
 ---
 name: qa
-description: QA test planning and evaluation agent. Privately creates a test plan with the orchestrator (hidden from the coder), writes test files to disk, runs tests, and evaluates results. Used internally by the orchestrator agent — not intended for direct invocation.
+description: "DEPRECATED — replaced by inspector.md. VZ/service_desk specific (widgetFrame fixture, mcp_service_desk_test_api, servicedesk URL, api_mcp strategy, playwright dir). Used by acme_coding_agent which is also deprecated."
 model: claude-haiku-4-5-20251001
 tools:
   - Read
