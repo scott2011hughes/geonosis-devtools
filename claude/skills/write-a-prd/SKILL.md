@@ -19,6 +19,11 @@ If given raw text with no JSON, invoke grill-me first.
 
 ## PRD Template
 
+### Scope
+- **Type**: `surgical_fix` | `feature_add` | `refactor` | `new_domain`
+- **Touch radius**: which layers, services, or files are affected
+- **Rationale**: one sentence justifying the classification
+
 ### Problem Statement
 The problem from the user's perspective.
 

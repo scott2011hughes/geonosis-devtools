@@ -64,6 +64,12 @@ Create `./plans/` if it doesn't exist. Write the plan as a Markdown file named a
 
 > Source PRD: <brief identifier or link>
 
+## Scope
+
+- **Type**: `surgical_fix` | `feature_add` | `refactor` | `new_domain`
+- **Touch radius**: ...
+- **Factory iterations**: (2 for surgical_fix / 3 for feature_add or refactor / 5 for new_domain)
+
 ## Architectural decisions
 
 Durable decisions that apply across all phases:

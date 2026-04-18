@@ -14,6 +14,7 @@ When there are no remaining open questions, output a single JSON block and nothi
 ```json
 {
   "feature": "",
+  "scope_type": "surgical_fix | feature_add | refactor | new_domain",
   "context": {
     "repo": "",
     "services": [],
@@ -30,5 +31,11 @@ When there are no remaining open questions, output a single JSON block and nothi
   "open_questions": []
 }
 ```
+
+`scope_type` is derived from the interview — do not ask explicitly. Infer from implementation_decisions:
+- `surgical_fix` — targeted change to existing behavior, 1–2 files
+- `feature_add` — net-new capability within existing structure
+- `refactor` — internal restructuring, no new external behavior
+- `new_domain` — new module, service, or cross-cutting concern
 
 open_questions must be empty before outputting. If any remain, keep interviewing.
