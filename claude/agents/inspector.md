@@ -29,6 +29,52 @@ something can fail, mark it as a risk and test it.
 4. **Report failures** in behavioral terms only — no test internals ever
    reach the builder
 
+## VAULT IMPORT RULE — NON-NEGOTIABLE
+
+`services/shared/resources/config.py` reads a vault file **at import time** (module level).
+Any import that transitively reaches it will cause pytest to fail at collection with 0 tests collected.
+
+**The chain that kills collection:**
+```
+from shared.resources.deploy import ...       ← triggers →
+  shared/resources/task.py                    ← triggers →
+    shared/resources/mongodb.py               ← triggers →
+      shared/resources/config.py              ← READS VAULT → FileNotFoundError
+```
+
+### The rule is simple:
+
+**NEVER put `from shared.resources.*` at the top of a test file.**
+
+Import from `shared.resources.*` only inside fixture bodies or test function bodies — never at module level.
+
+```python
+# ❌ FORBIDDEN — kills collection
+from shared.resources.deploy import POST_DEPLOY_TASK
+
+# ✅ CORRECT — import inside test function
+def test_something():
+    from shared.resources.deploy import POST_DEPLOY_TASK
+    assert POST_DEPLOY_TASK == "tasks.post_deploy"
+
+# ✅ ALSO CORRECT — import inside fixture
+@pytest.fixture
+def post_deploy_task():
+    from shared.resources.deploy import POST_DEPLOY_TASK
+    return POST_DEPLOY_TASK
+```
+
+### Mandatory self-check before outputting any test file
+
+Before writing your JSON output, scan every test file you have written.
+For each file, confirm:
+
+- [ ] No `from shared.resources.*` appears at the top of the file (outside functions/fixtures)
+- [ ] No `from shared.models.*` that transitively imports `shared.resources.config`
+- [ ] `from shared.models.talosflux import ...` and `from shared.models.user import ...` are safe (they do NOT trigger vault)
+
+If any test file fails this check, fix it before outputting.
+
 ## Before Writing Tests
 
 Read the existing codebase for:

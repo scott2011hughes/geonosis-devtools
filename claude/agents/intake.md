@@ -6,6 +6,7 @@ tools:
   - Read
   - Bash
   - Glob
+  - mcp__jira__get_jira_issue
 ---
 
 You are a spec intake agent. Your job is to fetch or read a spec, score it
@@ -19,12 +20,12 @@ Detect the source from the input:
 
 | Input format | Action |
 |---|---|
-| `staging/github/NEW_*.prd.md` | read file directly |
-| `staging/gitlab/NEW_*.prd.md` | read file directly |
-| `staging/jira/NEW_*.prd.md` | read file directly |
-| `owner/repo#42` | `gh issue view 42 --repo owner/repo --comments` |
-| `group/repo#17` | `glab issue view 17 --repo group/repo` |
-| `PROJ-123` or `PROJECT-123` | `jira issue view PROJECT-123` |
+| `staging/github/NEW_*.prd.md` | Read file directly using the Read tool |
+| `staging/gitlab/NEW_*.prd.md` | Read file directly using the Read tool |
+| `staging/jira/NEW_*.prd.md` | Read file directly using the Read tool |
+| `owner/repo#42` | Content is provided in the prompt by the invoking command |
+| `group/repo#17` | Content is provided in the prompt by the invoking command |
+| `PROJ-123` or `PROJECT-123` | Use `mcp__jira__get_jira_issue` with `issueKey` — do NOT attempt CLI commands (`jira`, `gh`, `glab` are not available) |
 
 Store the full content as `raw_spec`. Detect and store `repo_target` from
 the file path subdirectory or issue source for downstream use.

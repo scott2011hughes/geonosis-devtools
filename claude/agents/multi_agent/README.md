@@ -5,25 +5,103 @@ Orchestrates a plan → implement → QA feedback loop using three Claude Code n
 Lives at: `~/my_claude_automations/agents/` (symlinked into `.claude/agents/` of any repo via `link.sh`)
 
 ## Flow
-```mermaid
-flowchart TD
-    A[User Prompt] --> B[Orchestrator\n• Manages all state\n• Controls what each agent sees\n• Drives the loop]
-    B -->|Phase 1 – Plan Negotiation| C[Coder\nSees: User req\nProduces: PLAN_AGREED]
-    C -->|agreed plan| D[Orchestrator\nstores plan; QA never\nheard Phase 1 at all]
-    D -->|Phase 2 – Test Plan private| E[QA Agent\nSees: Plan only\nProduces: test files on disk]
-    E -->|Phase 3 – Loop 3-5x| F[Coder\nSees: Plan + Sanitized feedback\nno test details]
-    F -->|writes files| G[Run Tests\nplaywright/pytest/etc]
-    G --> H[QA Agent\nSees: Test output + Test plan]
-    H -->|No – sanitized feedback strips test names/paths/assertions| F
-    H -->|Yes – passed| I[Git Commit\nif git repo]
-    I --> J[Final Code\n+ QA Report]
-    J --> K[User]
+
+```
+              ┌─────────────────┐
+              │   User Prompt   │
+              └────────┬────────┘
+                       │
+                       ▼
+         ┌─────────────────────────┐
+         │       Orchestrator      │
+         │  • Manages all state    │
+         │  • Controls what each   │
+         │    agent sees           │
+         │  • Drives the loop      │
+         └────────────┬────────────┘
+                      │
+                      │ Phase 1 — Plan Negotiation
+                      ▼
+              ┌───────────────┐
+              │     Coder     │
+              │  Sees:        │
+              │  • User req   │
+              │               │
+              │  Produces:    │
+              │  PLAN_AGREED  │
+              └───────┬───────┘
+                      │ agreed plan
+                      ▼
+         ┌─────────────────────────┐
+         │       Orchestrator      │
+         │  stores plan; QA never  │
+         │  heard Phase 1 at all   │
+         └────────────┬────────────┘
+                      │
+                      │ Phase 2 — Test Plan (private)
+                      ▼
+              ┌───────────────┐
+              │   QA Agent    │
+              │  Sees:        │
+              │  • Plan only  │
+              │               │
+              │  Produces:    │
+              │  test files   │
+              │  (on disk)    │
+              └───────┬───────┘
+                      │
+                      │ Phase 3 — Loop (3–5×)
+                      │ ◄────────────────────────────┐
+                      ▼                              │
+              ┌───────────────┐                      │
+              │     Coder     │                      │
+              │  Sees:        │                      │
+              │  • Plan       │                      │
+              │  • Sanitized  │                      │
+              │    feedback   │                      │
+              │    (no test   │                      │
+              │    details)   │                      │
+              └───────┬───────┘                      │
+                      │ writes files                 │
+                      ▼                              │
+              ┌───────────────┐                      │
+              │  Run Tests    │                      │
+              │  (playwright/ │                      │
+              │   pytest/etc) │                      │
+              └───────┬───────┘                      │
+                      │                              │
+                      ▼                              │
+              ┌───────────────┐                      │
+              │   QA Agent    │   No — sanitized ────┘
+              │  Sees:        ├──────────────────────►
+              │  • Test output│   feedback (strips
+              │  • Test plan  │   test names/paths/
+              │               │   assertions)
+              └───────┬───────┘
+                      │ Yes — passed
+                      ▼
+              ┌───────────────┐
+              │  Git Commit   │
+              │  (if git repo)│
+              └───────┬───────┘
+                      │
+                      ▼
+              ┌───────────────┐
+              │  Final Code   │
+              │  + QA Report  │
+              └───────┬───────┘
+                      │
+                      ▼
+                  ┌───────┐
+                  │  User │
+                  └───────┘
 ```
 
 ## Usage
 
 From any project directory, invoke the orchestrator agent:
-```bash
+
+```
 # In Claude Code chat, mention the agent by name:
 @acme_coding_agent Add a users search endpoint that filters by name and email
 ```
@@ -48,7 +126,7 @@ Note: `/acme_coding_agent` (slash prefix) is NOT correct — that syntax is for 
 
 | Agent | File | Model | Role |
 |-------|------|-------|------|
-| acme_coding_agent | `agents/acme_coding_agent.md` | claude-opus-4-6 | State machine driver, spawns sub-agents |
+| acme_coding_agent | `agents/acme_coding_agent.md` | claude-opus-4-6 | State machine driver, spawns coder + QA |
 | coder | `agents/coder.md` | claude-sonnet-4-6 | Explores codebase, writes implementation files |
 | qa | `agents/qa.md` | claude-sonnet-4-6 | Creates test plan, evaluates results |
 
@@ -73,20 +151,20 @@ Note: `/acme_coding_agent` (slash prefix) is NOT correct — that syntax is for 
 
 ## Context Isolation
 
-The Coder **never** sees the QA test plan. The orchestrator sanitizes QA feedback to strip test
-function names, file paths, and assertions before any feedback reaches the Coder. Only behavioral
-failure descriptions are forwarded.
+The Coder **never** sees the QA test plan. The orchestrator sanitizes QA feedback to strip test function names,
+file paths, and assertions before any feedback reaches the Coder. Only behavioral failure descriptions are forwarded.
 
 ## Git Behaviour
 
 - Detects git at startup via `git rev-parse`
 - If not a git repo (e.g. service_desk platform): commit step silently skipped
 - Commits to the **current branch** — no branch creation, no PR
-- Commit message format: `` `feat: <plan summary> [passing|partial]` ``
+- Commit message format: `feat: <plan summary> [passing|partial]`
 
 ## Setup
 
 The agents are automatically available in any repo that has been linked:
+
 ```bash
 ~/my_claude_automations/link.sh /path/to/your/repo
 ```
