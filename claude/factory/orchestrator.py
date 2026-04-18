@@ -255,7 +255,7 @@ def inject_eec(system_prompt: str, eec: dict) -> str:
 # Scaffold gate
 # ---------------------------------------------------------------------------
 
-def scaffold_gate(scaffold_requests: list, eec: dict) -> tuple[bool, str | None]:
+def scaffold_gate(scaffold_requests: list) -> tuple[bool, str | None]:
     """
     Present scaffold requests to the user.
     Returns (approved: bool, instead_message: str | None).
@@ -602,7 +602,7 @@ def phase_test_plan(client, config, eec, agreed_plan, strategy, feature_tag,
 
     # Scaffold gate — ask user before creating any new structure
     if scaffold_requests and eec.get("scaffold_policy", {}).get("requires_user_approval", True):
-        approved, instead_msg = scaffold_gate(scaffold_requests, eec)
+        approved, instead_msg = scaffold_gate(scaffold_requests)
         if approved:
             for req in scaffold_requests:
                 path = req.get("path", "")
@@ -729,7 +729,7 @@ def phase_implement(client, config, eec, agreed_plan, feedback, scope_type,
             written_files.append(rel_path)
 
     # Deploy services affected by written files (reads from EEC — no-op if unconfigured)
-    phase_deploy(written_files, eec, cwd, pid, log_dir)
+    phase_deploy(written_files, eec, cwd, log_dir)
 
     sidecar.update({
         "phase": f"IMPLEMENT_{iteration}_DONE",
@@ -741,20 +741,15 @@ def phase_implement(client, config, eec, agreed_plan, feedback, scope_type,
     return written_files
 
 
-def phase_deploy(written_files: list, eec: dict, cwd: Path, pid: int, log_dir: Path):
+def phase_deploy(written_files: list, eec: dict, cwd: Path, log_dir: Path):
     """
-    Run make deploy targets for services affected by written files.
-    Reads service paths and deploy targets from eec.execution.services.
-    No-ops if EEC has no services or Makefile is absent.
+    Run deploy targets for services affected by written files.
+    Reads service paths and deploy_command from eec.execution.
+    No-ops when deploy_command is null/absent in EEC.
     """
+    deploy_cmd = eec.get("execution", {}).get("deploy_command")
     services = eec.get("execution", {}).get("services", {})
-    deploy_cmd = eec.get("execution", {}).get("deploy_command", "make")
-    if not services or not written_files:
-        return
-
-    makefile = cwd / "Makefile"
-    if not makefile.exists():
-        log(log_dir, "No Makefile found — skipping deploy")
+    if not deploy_cmd or not services or not written_files:
         return
 
     targets: set[str] = set()
@@ -892,7 +887,7 @@ def sanitize_feedback(qa_report: str) -> str:
     return "\n".join(lines)
 
 
-def phase_git_commit(agreed_plan, feature_tag, written_files, passed, cwd,
+def phase_git_commit(agreed_plan, feature_tag, _written_files, passed, cwd,
                      config, pid, log_dir, sidecar, plan):
     phase_start(pid, log_dir, "7/8", "GIT COMMIT")
     assert_lock(plan, log_dir, pid)
@@ -922,7 +917,7 @@ def phase_git_commit(agreed_plan, feature_tag, written_files, passed, cwd,
     print(f"  git -C {cwd} push\n")
 
 
-def archive_plan(plan: Path, log_dir: Path, pid: int, partial: bool = False):
+def archive_plan(plan: Path, log_dir: Path, pid: int, _partial: bool = False):
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
     stem = plan.name.replace("IP_", "")
     done_name = f"done-{timestamp}-{stem}"
@@ -930,10 +925,11 @@ def archive_plan(plan: Path, log_dir: Path, pid: int, partial: bool = False):
     plan.rename(dest)
     release_sidecar(plan)
     release_lock(plan)
+    status_path(pid).unlink(missing_ok=True)
     log(log_dir, f"Archived to {done_name}")
 
 
-def phase_deliver(agreed_plan, strategy, written_files, passed, qa_report,
+def phase_deliver(strategy, written_files, passed, qa_report,
                   iteration, max_iterations, scope_type, pid, log_dir, plan):
     phase_start(pid, log_dir, "8/8", "DELIVER")
 
@@ -1078,7 +1074,7 @@ def main():
                 cwd, config, pid, log_dir, sidecar, plan)
 
         phase_deliver(
-            agreed_plan, strategy, written_files, passed, qa_report,
+            strategy, written_files, passed, qa_report,
             iteration, max_iterations, scope_type, pid, log_dir, plan)
 
     except KeyboardInterrupt:

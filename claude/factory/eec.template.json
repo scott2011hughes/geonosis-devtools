@@ -54,8 +54,10 @@
 
   "execution": {
     "test_command": ["pytest", "--tb=short", "-v"],
-    "services": [],
-    "deploy_targets": {}
+    "deploy_command": null,
+    "_deploy_command_note": "Set to your deploy invocation e.g. 'make -j' or 'docker-compose up -d'. null = no deploy step.",
+    "services": {},
+    "_services_note": "Map service names to {path, deploy_target}. deploy_target is passed as args to deploy_command."
   },
 
   "rules": {
