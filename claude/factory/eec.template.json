@@ -1,0 +1,67 @@
+{
+  "_readme": "Copy to {repo_name}_eec.json in your repo root. Set maturity=established only after manually confirming the test structure runs.",
+  "repo": "",
+  "maturity": "bootstrap",
+
+  "paths": {
+    "app_root": "",
+    "tests_root": "",
+    "test_tiers": {
+      "unit": "",
+      "integration": "",
+      "e2e": ""
+    }
+  },
+
+  "imports": {
+    "allowed_roots": [],
+    "forbidden_import_roots": [],
+    "forbid_relative_traversal": true,
+    "forbidden_module_level": [],
+    "stdlib_passthrough": true,
+    "third_party_passthrough": true
+  },
+
+  "canonical_entry_points": {
+    "_example_remove_this": {
+      "use": "from shared.resources.mongodb import get_mongodb",
+      "forbidden_imports": ["pymongo.MongoClient", "pymongo"],
+      "reason": "get_mongodb() handles connection pooling and vault credential resolution — direct pymongo breaks test environments"
+    }
+  },
+
+  "filesystem": {
+    "allowed_write": [],
+    "forbidden_write": [
+      "pytest.ini",
+      "pyproject.toml",
+      "setup.cfg",
+      "conftest.py"
+    ]
+  },
+
+  "scaffold_policy": {
+    "qa_can_request": true,
+    "requires_user_approval": true,
+    "must_match_test_tiers": true
+  },
+
+  "conftest_policy": {
+    "root_immutable": true,
+    "domain_conftest_requires_approval": true,
+    "local_fixtures_preferred": true
+  },
+
+  "execution": {
+    "test_command": ["pytest", "--tb=short", "-v"],
+    "services": [],
+    "deploy_targets": {}
+  },
+
+  "rules": {
+    "tests_are_oracle": true,
+    "tests_not_editable": true
+  },
+
+  "scope_hint": null
+}

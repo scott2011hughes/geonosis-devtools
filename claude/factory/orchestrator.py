@@ -5,12 +5,13 @@ Drives the implement → test → feedback loop for a single PRD plan file.
 Invoked by /factory command per IP_ plan file.
 
 Usage:
-  python3 orchestrator.py --plan path/to/IP_feature.prd.md
+  python3 orchestrator.py --plan path/to/IP_feature.prd.md [--config path/to/factory_config.json]
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -25,16 +26,256 @@ import anthropic
 
 CONFIG_PATH = Path(__file__).parent / "factory_config.json"
 
-def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        print(f"[factory] ERROR: config not found at {CONFIG_PATH}")
+def load_config(config_path: Path | None = None) -> dict:
+    path = config_path or CONFIG_PATH
+    if not path.exists():
+        print(f"[factory] ERROR: config not found at {path}")
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
+    with open(path) as f:
         raw = f.read()
-    # Expand {repo_root} to the factory directory's parent parent (.claude/factory -> .claude -> repo)
-    repo_root = str(CONFIG_PATH.parent.parent.parent)
+    repo_root = str(path.parent.parent.parent)
+    repo_name = Path(repo_root).name
     raw = raw.replace("{repo_root}", repo_root)
+    raw = raw.replace("{repo_name}", repo_name)
     return json.loads(raw)
+
+
+def load_eec(config: dict) -> dict:
+    """Load project EEC from {repo_root}/{repo_name}_eec.json."""
+    eec_path_str = config.get("eec_path", "")
+    if not eec_path_str:
+        repo_root = Path(config.get("repo_root", "."))
+        repo_name = repo_root.name
+        eec_path = repo_root / f"{repo_name}_eec.json"
+    else:
+        eec_path = Path(eec_path_str)
+
+    if not eec_path.exists():
+        print(f"\n\033[1;31mSTARTUP BLOCKED: No EEC file found.\033[0m")
+        print(f"  Expected: {eec_path}")
+        template = Path(__file__).parent / "eec.template.json"
+        print(f"  Copy from: {template}")
+        print(f"  Fill in: repo, maturity, paths, imports, canonical_entry_points, filesystem\n")
+        sys.exit(1)
+
+    with open(eec_path) as f:
+        eec = json.load(f)
+
+    # Remove example entry if not filled in
+    cep = eec.get("canonical_entry_points", {})
+    if "_example_remove_this" in cep:
+        del cep["_example_remove_this"]
+
+    return eec
+
+
+def maturity_check(eec: dict, cwd: Path) -> bool:
+    """
+    Check project maturity. Returns True if ready to proceed.
+    If bootstrap or test dirs missing, prompts user.
+    """
+    maturity = eec.get("maturity", "bootstrap")
+    test_tiers = eec.get("paths", {}).get("test_tiers", {})
+
+    missing_dirs = []
+    for tier, rel_path in test_tiers.items():
+        if rel_path and not (cwd / rel_path).exists():
+            missing_dirs.append(f"{tier}: {rel_path}")
+
+    if maturity == "bootstrap" or missing_dirs:
+        print(f"\n\033[1;33m⚠  MATURITY GATE\033[0m")
+        if maturity == "bootstrap":
+            print(f"  maturity is set to 'bootstrap' — architecture may need manual setup first")
+        if missing_dirs:
+            print(f"  Missing test directories:")
+            for d in missing_dirs:
+                print(f"    {d}")
+        print()
+        print("Manually create the missing structure, then set maturity='established' in the EEC.")
+        print("Proceed anyway? (yes / abort)")
+        choice = input("> ").strip().lower()
+        return choice in ("yes", "y")
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# EEC validation
+# ---------------------------------------------------------------------------
+
+STDLIB_ROOTS = frozenset({
+    "abc", "ast", "asyncio", "base64", "builtins", "calendar", "cgi",
+    "collections", "concurrent", "contextlib", "copy", "csv", "dataclasses",
+    "datetime", "decimal", "difflib", "email", "enum", "errno", "functools",
+    "gc", "glob", "gzip", "hashlib", "hmac", "html", "http", "importlib",
+    "inspect", "io", "itertools", "json", "keyword", "logging", "math",
+    "mimetypes", "multiprocessing", "operator", "os", "pathlib", "pickle",
+    "platform", "pprint", "queue", "random", "re", "shutil", "signal",
+    "socket", "sqlite3", "ssl", "stat", "string", "struct", "subprocess",
+    "sys", "tempfile", "textwrap", "threading", "time", "timeit", "traceback",
+    "types", "typing", "unittest", "urllib", "uuid", "warnings", "weakref",
+    "xml", "xmlrpc", "zipfile", "zlib",
+    # common test tools (pass through)
+    "pytest", "mock", "unittest",
+})
+
+
+def validate_file(rel_path: str, content: str, eec: dict) -> list[dict]:
+    """
+    Run all EEC checks against a single file before it hits disk.
+    Returns a list of violation dicts (empty = valid).
+    Does NOT consume an iteration — caller must handle retry.
+    """
+    violations = []
+    lines = content.splitlines()
+    filesystem = eec.get("filesystem", {})
+    imports_cfg = eec.get("imports", {})
+
+    # 1. Forbidden write paths
+    forbidden_write = filesystem.get("forbidden_write", [])
+    rel_basename = Path(rel_path).name
+    for pattern in forbidden_write:
+        if rel_path == pattern or rel_basename == pattern or rel_path.endswith("/" + pattern):
+            violations.append({
+                "file": rel_path,
+                "type": "FORBIDDEN_WRITE",
+                "line": None,
+                "text": rel_path,
+                "correction": f"'{rel_path}' matches eec.filesystem.forbidden_write — do not write this file",
+            })
+
+    # 2. Allowed write paths (only enforced if list is non-empty)
+    allowed_write = filesystem.get("allowed_write", [])
+    if allowed_write:
+        in_allowed = any(
+            rel_path == a or rel_path.startswith(a.rstrip("/") + "/")
+            for a in allowed_write
+        )
+        if not in_allowed:
+            violations.append({
+                "file": rel_path,
+                "type": "ALLOWED_WRITE",
+                "line": None,
+                "text": rel_path,
+                "correction": f"'{rel_path}' is outside eec.filesystem.allowed_write: {allowed_write}",
+            })
+
+    # 3. Relative traversal (..) — any depth, any position in file
+    traversal_pat = re.compile(r"^\s*from\s+(\.{2,})")
+    for n, line in enumerate(lines, 1):
+        if traversal_pat.match(line):
+            violations.append({
+                "file": rel_path,
+                "type": "RELATIVE_TRAVERSAL",
+                "line": n,
+                "text": line.strip(),
+                "correction": "Use absolute imports — relative traversal (..) is forbidden by EEC",
+            })
+
+    # 4. Forbidden import roots (explicit list — catches wrong container paths)
+    forbidden_roots = imports_cfg.get("forbidden_import_roots", [])
+    if forbidden_roots:
+        import_root_pat = re.compile(r"^(?:from|import)\s+(\w+)")
+        for n, line in enumerate(lines, 1):
+            if line.startswith((" ", "\t")):
+                continue  # skip indented imports (inside functions/classes)
+            m = import_root_pat.match(line.strip())
+            if m:
+                root = m.group(1)
+                if root in forbidden_roots:
+                    allowed = imports_cfg.get("allowed_roots", [])
+                    violations.append({
+                        "file": rel_path,
+                        "type": "IMPORT_ROOT",
+                        "line": n,
+                        "text": line.strip(),
+                        "correction": (
+                            f"Root '{root}' is in eec.imports.forbidden_import_roots — "
+                            f"use a root from: {allowed}"
+                        ),
+                    })
+
+    # 5. Canonical entry points — module-level forbidden imports
+    cep = eec.get("canonical_entry_points", {})
+    for _entry_name, entry in cep.items():
+        for forbidden_import in entry.get("forbidden_imports", []):
+            escaped = re.escape(forbidden_import)
+            pat = re.compile(rf"^(?:from|import)\s+{escaped}")
+            for n, line in enumerate(lines, 1):
+                if line.startswith((" ", "\t")):
+                    continue  # only flag module-level
+                if pat.match(line.strip()):
+                    violations.append({
+                        "file": rel_path,
+                        "type": "CANONICAL_ENTRY_POINT",
+                        "line": n,
+                        "text": line.strip(),
+                        "correction": (
+                            f"Use: {entry.get('use', 'see EEC')} — "
+                            f"reason: {entry.get('reason', 'see EEC canonical_entry_points')}"
+                        ),
+                    })
+
+    return violations
+
+
+def format_violations(violations: list[dict]) -> str:
+    lines = [f"VALIDATION FAILED — {len(violations)} violation(s). No files were written.\n"]
+    for v in violations:
+        loc = f"line {v['line']}" if v.get("line") else "file level"
+        lines.append(f"  [{v['type']}] {v['file']} ({loc})")
+        lines.append(f"    Found:      {v['text']}")
+        lines.append(f"    Correction: {v['correction']}")
+        lines.append("")
+    lines.append("Fix all violations and resubmit the complete JSON block.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# EEC injection
+# ---------------------------------------------------------------------------
+
+def inject_eec(system_prompt: str, eec: dict) -> str:
+    """Prepend EEC block to any system prompt sent to a subagent."""
+    eec_json = json.dumps(eec, indent=2)
+    header = (
+        "<<<EEC_START>>>\n"
+        f"{eec_json}\n"
+        "<<<EEC_END>>>\n\n"
+        "The Execution Environment Contract above is immutable ground truth.\n"
+        "- Never write to filesystem.forbidden_write paths\n"
+        "- Never use imports in imports.forbidden_import_roots\n"
+        "- Never use relative traversal imports (from ..)\n"
+        "- Always use canonical_entry_points instead of their forbidden_imports\n\n"
+    )
+    return header + system_prompt
+
+
+# ---------------------------------------------------------------------------
+# Scaffold gate
+# ---------------------------------------------------------------------------
+
+def scaffold_gate(scaffold_requests: list, eec: dict) -> tuple[bool, str | None]:
+    """
+    Present scaffold requests to the user.
+    Returns (approved: bool, instead_message: str | None).
+    instead_message is set when user types 'Instead: ...'
+    """
+    print(f"\n\033[1;33m⚠  SCAFFOLD GATE\033[0m — inspector requests new structure:\n")
+    for req in scaffold_requests:
+        print(f"  Create {req.get('type', 'directory')}: {req.get('path')}")
+        if req.get("reason"):
+            print(f"    Reason: {req['reason']}")
+    print()
+    print("[Y] Create all   [N] Skip — inspector adapts   [Instead] Specify alternative path")
+    choice = input("> ").strip()
+    if choice.upper() == "Y":
+        return True, None
+    elif choice.upper() == "N":
+        return False, None
+    else:
+        return False, choice  # pass back to inspector as correction
+
 
 # ---------------------------------------------------------------------------
 # Agent MD loader — strips YAML frontmatter, returns body as system prompt
@@ -52,6 +293,7 @@ def load_agent_prompt(config: dict, agent_name: str) -> str:
         if len(parts) >= 3:
             return parts[2].strip()
     return content.strip()
+
 
 # ---------------------------------------------------------------------------
 # Sidecar / lock helpers
@@ -79,7 +321,6 @@ def write_lock(plan: Path):
         f.write(str(os.getpid()))
 
 def check_lock(plan: Path) -> bool:
-    """Return True if we still own the lock."""
     lp = lock_path(plan)
     if not lp.exists():
         return False
@@ -95,6 +336,7 @@ def release_sidecar(plan: Path):
     sp = sidecar_path(plan)
     if sp.exists():
         sp.unlink()
+
 
 # ---------------------------------------------------------------------------
 # Status / logging
@@ -137,8 +379,9 @@ def phase_fail(pid: int, log_dir: Path, phase: str, detail: str = ""):
     write_status(pid, msg)
     log(log_dir, f"FAIL  {msg}")
 
+
 # ---------------------------------------------------------------------------
-# Lock guard — called before every destructive action
+# Lock guard
 # ---------------------------------------------------------------------------
 
 def assert_lock(plan: Path, log_dir: Path, pid: int):
@@ -146,23 +389,18 @@ def assert_lock(plan: Path, log_dir: Path, pid: int):
         phase_fail(pid, log_dir, "LOCK", "lock lost — another process owns this plan, exiting")
         sys.exit(1)
 
+
 # ---------------------------------------------------------------------------
 # Dirty plan detection and reset
 # ---------------------------------------------------------------------------
 
 def handle_dirty_plan(plan: Path, cwd: Path, log_dir: Path, pid: int):
-    """
-    Called when a .run sidecar exists at startup.
-    If a commit with the feature tag exists since run start → archive and deliver.
-    Otherwise → git reset hard, remove sidecar, start fresh.
-    """
     sidecar = read_sidecar(plan)
     feature_tag = sidecar.get("feature_tag", "")
     started = sidecar.get("started", "")
 
     log(log_dir, f"Dirty plan detected. Sidecar: phase={sidecar.get('phase')} tag={feature_tag}")
 
-    # Check for an existing commit with the feature tag since run start
     result = subprocess.run(
         ["git", "-C", str(cwd), "log", "--oneline", f"--since={started}", "--grep", feature_tag],
         capture_output=True, text=True
@@ -179,6 +417,7 @@ def handle_dirty_plan(plan: Path, cwd: Path, log_dir: Path, pid: int):
         release_sidecar(plan)
         log(log_dir, "Repo reset. Sidecar removed. Starting fresh.")
 
+
 # ---------------------------------------------------------------------------
 # Claude SDK call
 # ---------------------------------------------------------------------------
@@ -193,6 +432,7 @@ def call_claude(client: anthropic.Anthropic, model: str, system: str, messages: 
     )
     return response.content[0].text
 
+
 # ---------------------------------------------------------------------------
 # Sentinel extraction
 # ---------------------------------------------------------------------------
@@ -203,24 +443,63 @@ def extract_sentinel(text: str, sentinel: str) -> str | None:
             return line[len(sentinel):].strip()
     return None
 
+
+def extract_json_block(text: str) -> dict | None:
+    if "```json" not in text:
+        return None
+    try:
+        json_str = text.split("```json")[1].split("```")[0].strip()
+        return json.loads(json_str)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Scope helpers
+# ---------------------------------------------------------------------------
+
+SCOPE_ITERATIONS = {
+    "surgical_fix": 2,
+    "feature_add": 3,
+    "refactor": 3,
+    "new_domain": 5,
+}
+
+
+def extract_scope_type(plan_content: str) -> str:
+    """Extract scope_type from PRD JSON block in plan file."""
+    data = extract_json_block(plan_content)
+    if data:
+        scope = data.get("scope_type", "")
+        if scope in SCOPE_ITERATIONS:
+            return scope
+    return "feature_add"
+
+
 # ---------------------------------------------------------------------------
 # Phase implementations
 # ---------------------------------------------------------------------------
 
-def phase_plan_negotiation(client, config, plan_content, pid, log_dir, sidecar, plan):
+def phase_plan_negotiation(client, config, eec, plan_content, scope_type,
+                           pid, log_dir, sidecar, plan):
     phase_start(pid, log_dir, "1/8", "PLAN NEGOTIATION")
     assert_lock(plan, log_dir, pid)
 
     builder_model = config["models"]["builder"]
-    system = load_agent_prompt(config, "builder")
+    system = inject_eec(load_agent_prompt(config, "builder"), eec)
+
+    scope_note = ""
+    if scope_type == "surgical_fix":
+        scope_note = "\n\nScope is surgical_fix — touch the minimum files necessary. If you need more than 2 files, say so explicitly in PLAN_AGREED."
+
     messages = [{"role": "user", "content": (
-        f"PRD:\n\n{plan_content}\n\n"
+        f"PRD:\n\n{plan_content}{scope_note}\n\n"
         "Review this PRD and confirm your implementation plan. "
         "Output PLAN_AGREED: <one paragraph> when ready."
     )}]
 
     agreed_plan = None
-    for turn in range(10):
+    for _turn in range(10):
         reply = call_claude(client, builder_model, system, messages)
         messages.append({"role": "assistant", "content": reply})
         sentinel = extract_sentinel(reply, "PLAN_AGREED:")
@@ -239,8 +518,17 @@ def phase_plan_negotiation(client, config, plan_content, pid, log_dir, sidecar, 
     return agreed_plan
 
 
-def phase_strategy_detection(agreed_plan, plan_content, pid, log_dir, sidecar, plan):
+def phase_strategy_detection(agreed_plan, plan_content, eec, pid, log_dir, sidecar, plan):
     phase_start(pid, log_dir, "2/8", "STRATEGY DETECTION")
+
+    # Use EEC test_command if set and non-default
+    eec_cmd = eec.get("execution", {}).get("test_command", [])
+    if eec_cmd and eec_cmd != ["pytest", "--tb=short", "-v"]:
+        strategy = "custom"
+        phase_done(pid, log_dir, "2/8", f"custom (from EEC: {eec_cmd})")
+        sidecar.update({"phase": "STRATEGY_DONE", "strategy": strategy})
+        write_sidecar(plan, sidecar)
+        return strategy
 
     combined = (agreed_plan + plan_content).lower()
     if "playwright" in combined and ("pytest" in combined or "python test" in combined):
@@ -249,13 +537,10 @@ def phase_strategy_detection(agreed_plan, plan_content, pid, log_dir, sidecar, p
         strategy = "playwright"
     elif "pytest" in combined or "python test" in combined:
         strategy = "pytest"
-    elif "api_mcp" in combined:
-        strategy = "api_mcp"
     else:
         strategy = "pytest"
 
-    sidecar["phase"] = "STRATEGY_DONE"
-    sidecar["strategy"] = strategy
+    sidecar.update({"phase": "STRATEGY_DONE", "strategy": strategy})
     write_sidecar(plan, sidecar)
     phase_done(pid, log_dir, "2/8", strategy)
     return strategy
@@ -265,25 +550,29 @@ def phase_feature_tag(agreed_plan, pid, log_dir, sidecar, plan):
     phase_start(pid, log_dir, "2.5/8", "FEATURE TAG")
 
     words = agreed_plan.lower().split()
-    stopwords = {"a", "an", "the", "and", "or", "to", "for", "of", "in", "with", "that", "this"}
-    tag_words = [w for w in words if w.isalpha() and w not in stopwords][:3]
-    feature_tag = "@" + "-".join(tag_words)
+    stopwords = {"a", "an", "the", "and", "or", "to", "for", "of", "in", "with",
+                 "that", "this", "is", "are", "was", "be", "by", "as"}
+    tag_words = [re.sub(r"[^a-z0-9]", "", w) for w in words
+                 if w.isalpha() and w not in stopwords][:3]
+    feature_tag = "@" + "-".join(w for w in tag_words if w)
 
-    sidecar["phase"] = "FEATURE_TAG_DONE"
-    sidecar["feature_tag"] = feature_tag
+    sidecar.update({"phase": "FEATURE_TAG_DONE", "feature_tag": feature_tag})
     write_sidecar(plan, sidecar)
     phase_done(pid, log_dir, "2.5/8", feature_tag)
     return feature_tag
 
 
-def phase_test_plan(client, config, agreed_plan, strategy, feature_tag, pid, log_dir, sidecar, plan, cwd):
+def phase_test_plan(client, config, eec, agreed_plan, strategy, feature_tag,
+                    pid, log_dir, sidecar, plan, cwd):
     phase_start(pid, log_dir, "3/8", "TEST PLAN CREATION (private)")
     assert_lock(plan, log_dir, pid)
 
     inspector_model = config["models"]["inspector"]
-    playwright_dir = Path(config.get("playwright_dir", "~/my_claude_automations/playwright")).expanduser()
+    playwright_dir = Path(
+        config.get("playwright_dir", "~/my_claude_automations/playwright")
+    ).expanduser()
 
-    system = load_agent_prompt(config, "inspector")
+    system = inject_eec(load_agent_prompt(config, "inspector"), eec)
     messages = [{"role": "user", "content": (
         f"Implementation plan:\n\n{agreed_plan}\n\n"
         f"Test strategy: {strategy}. Feature tag: {feature_tag}. "
@@ -293,20 +582,17 @@ def phase_test_plan(client, config, agreed_plan, strategy, feature_tag, pid, log
     test_summary = None
     test_files = {}
     test_command = None
+    scaffold_requests = []
 
     for _ in range(8):
         reply = call_claude(client, inspector_model, system, messages)
         messages.append({"role": "assistant", "content": reply})
 
-        # Extract JSON block
-        if "```json" in reply:
-            try:
-                json_str = reply.split("```json")[1].split("```")[0].strip()
-                data = json.loads(json_str)
-                test_files = data.get("files", {})
-                test_command = data.get("command")
-            except Exception:
-                pass
+        data = extract_json_block(reply)
+        if data:
+            test_files = data.get("files", {})
+            test_command = data.get("command")
+            scaffold_requests = data.get("scaffold_requests", [])
 
         sentinel = extract_sentinel(reply, "TEST_PLAN_READY:")
         if sentinel:
@@ -314,7 +600,43 @@ def phase_test_plan(client, config, agreed_plan, strategy, feature_tag, pid, log
             break
         messages.append({"role": "user", "content": "Continue building the test plan."})
 
-    # Write test files to disk
+    # Scaffold gate — ask user before creating any new structure
+    if scaffold_requests and eec.get("scaffold_policy", {}).get("requires_user_approval", True):
+        approved, instead_msg = scaffold_gate(scaffold_requests, eec)
+        if approved:
+            for req in scaffold_requests:
+                path = req.get("path", "")
+                if path and req.get("type", "directory") == "directory":
+                    (cwd / path).mkdir(parents=True, exist_ok=True)
+                    log(log_dir, f"Scaffolded directory: {path}")
+        elif instead_msg:
+            # Send alternative back to inspector for one revision
+            messages.append({"role": "user", "content":
+                f"Instead of the scaffold requests, use this alternative: {instead_msg}"})
+            reply = call_claude(client, inspector_model, system, messages)
+            data = extract_json_block(reply)
+            if data:
+                test_files = data.get("files", {})
+                test_command = data.get("command")
+
+    # Validate and write test files
+    all_violations = []
+    for rel_path, content in test_files.items():
+        violations = validate_file(rel_path, content, eec)
+        all_violations.extend(violations)
+
+    if all_violations:
+        violation_msg = format_violations(all_violations)
+        log(log_dir, f"Test file validation failed: {len(all_violations)} violations")
+        print(f"\033[1;31m✗  TEST FILES FAILED VALIDATION — {len(all_violations)} violations\033[0m")
+        print(violation_msg)
+        # Send back to inspector for correction (not an iteration)
+        messages.append({"role": "user", "content": violation_msg})
+        reply = call_claude(client, inspector_model, system, messages)
+        data = extract_json_block(reply)
+        if data:
+            test_files = data.get("files", {})
+
     for rel_path, content in test_files.items():
         if strategy == "playwright":
             dest = playwright_dir / rel_path
@@ -323,21 +645,23 @@ def phase_test_plan(client, config, agreed_plan, strategy, feature_tag, pid, log
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content)
 
-    sidecar["phase"] = "TEST_PLAN_DONE"
-    sidecar["test_summary"] = test_summary or "test plan created"
-    sidecar["test_command"] = test_command
+    sidecar.update({
+        "phase": "TEST_PLAN_DONE",
+        "test_summary": test_summary or "test plan created",
+        "test_command": test_command,
+    })
     write_sidecar(plan, sidecar)
     phase_done(pid, log_dir, "3/8", test_summary or "")
-    # Return test info but NEVER pass to builder
     return test_summary, test_files, test_command
 
 
-def phase_implement(client, config, agreed_plan, feedback, iteration, pid, log_dir, sidecar, plan, cwd):
-    phase_start(pid, log_dir, f"4/8", f"IMPLEMENT iteration {iteration}")
+def phase_implement(client, config, eec, agreed_plan, feedback, scope_type,
+                    iteration, pid, log_dir, sidecar, plan, cwd):
+    phase_start(pid, log_dir, "4/8", f"IMPLEMENT iteration {iteration}")
     assert_lock(plan, log_dir, pid)
 
     builder_model = config["models"]["builder"]
-    system = load_agent_prompt(config, "builder")
+    system = inject_eec(load_agent_prompt(config, "builder"), eec)
 
     if iteration == 1:
         prompt = f"Implement this plan:\n\n{agreed_plan}"
@@ -348,25 +672,67 @@ def phase_implement(client, config, agreed_plan, feedback, iteration, pid, log_d
                         [{"role": "user", "content": prompt}], max_tokens=8192)
 
     written_files = []
-    if "```json" in reply:
-        try:
-            json_str = reply.split("```json")[1].split("```")[0].strip()
-            data = json.loads(json_str)
-            for rel_path, content in data.get("files", {}).items():
-                # Path safety — reject traversal attempts
-                dest = (cwd / rel_path).resolve()
-                if not str(dest).startswith(str(cwd.resolve())):
-                    log(log_dir, f"REJECTED unsafe path: {rel_path}")
-                    continue
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(content)
-                written_files.append(rel_path)
-        except Exception as e:
-            log(log_dir, f"Failed to parse builder JSON: {e}")
+    data = extract_json_block(reply)
+    if data:
+        files_to_write = data.get("files", {})
 
-    sidecar["phase"] = f"IMPLEMENT_{iteration}_DONE"
-    sidecar["iteration"] = iteration
-    sidecar["written_files"] = written_files
+        # Scope check — warn if surgical_fix but many files
+        if scope_type == "surgical_fix" and len(files_to_write) > 2:
+            print(f"\n\033[1;33m⚠  SCOPE WARNING — surgical_fix but {len(files_to_write)} files:\033[0m")
+            for p in files_to_write.keys():
+                print(f"  {p}")
+            print("Continue? (Y / abort)")
+            if input("> ").strip().upper() != "Y":
+                sys.exit(1)
+
+        # EEC validation — run before writing anything
+        all_violations = []
+        for rel_path, content in files_to_write.items():
+            violations = validate_file(rel_path, content, eec)
+            all_violations.extend(violations)
+
+        if all_violations:
+            violation_msg = format_violations(all_violations)
+            log(log_dir, f"Validation failed: {len(all_violations)} violations — sending correction")
+            print(f"\033[1;31m✗  VALIDATION FAILED — {len(all_violations)} violations (no iteration consumed)\033[0m")
+
+            # Non-iteration retry
+            retry_reply = call_claude(
+                client, builder_model, system,
+                [{"role": "user", "content": prompt},
+                 {"role": "assistant", "content": reply},
+                 {"role": "user", "content": violation_msg}],
+                max_tokens=8192,
+            )
+            data = extract_json_block(retry_reply)
+            if data:
+                files_to_write = data.get("files", {})
+                # Re-validate once
+                remaining = []
+                for rel_path, content in files_to_write.items():
+                    remaining.extend(validate_file(rel_path, content, eec))
+                if remaining:
+                    log(log_dir, f"Validation still failing after retry ({len(remaining)} violations) — writing what passed")
+                    files_to_write = {
+                        p: c for p, c in files_to_write.items()
+                        if not validate_file(p, c, eec)
+                    }
+
+        # Write validated files
+        for rel_path, content in files_to_write.items():
+            dest = (cwd / rel_path).resolve()
+            if not str(dest).startswith(str(cwd.resolve())):
+                log(log_dir, f"REJECTED unsafe path: {rel_path}")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content)
+            written_files.append(rel_path)
+
+    sidecar.update({
+        "phase": f"IMPLEMENT_{iteration}_DONE",
+        "iteration": iteration,
+        "written_files": written_files,
+    })
     write_sidecar(plan, sidecar)
     phase_done(pid, log_dir, "4/8", f"{len(written_files)} files written")
     return written_files
@@ -376,7 +742,9 @@ def phase_preflight(config, pid, log_dir, sidecar, plan):
     phase_start(pid, log_dir, "4.5/8", "PRE-FLIGHT CHECK")
     assert_lock(plan, log_dir, pid)
 
-    healthcheck = Path(config.get("healthcheck_script", "~/my_claude_automations/healthcheck.sh")).expanduser()
+    healthcheck = Path(
+        config.get("healthcheck_script", "~/my_claude_automations/healthcheck.sh")
+    ).expanduser()
     if not healthcheck.exists():
         log(log_dir, "No healthcheck script found — skipping preflight")
         phase_done(pid, log_dir, "4.5/8", "skipped")
@@ -406,47 +774,44 @@ Fix the issues above, then:
         if choice == "abort":
             sys.exit(1)
         elif choice == "skip":
-            return -1  # signal to skip phase 5
+            return -1
         elif choice == "continue":
             return phase_preflight(config, pid, log_dir, sidecar, plan)
 
     return exit_code
 
 
-def phase_qa_evaluation(client, config, strategy, test_command, cwd, pid, log_dir,
-                        sidecar, plan, iteration):
-    phase_start(pid, log_dir, f"5/8", f"QA EVALUATION iteration {iteration}")
+def phase_qa_evaluation(client, config, eec, strategy, test_command, cwd,
+                        pid, log_dir, sidecar, plan, iteration):
+    phase_start(pid, log_dir, "5/8", f"QA EVALUATION iteration {iteration}")
     assert_lock(plan, log_dir, pid)
 
     inspector_model = config["models"]["inspector"]
-    playwright_dir = Path(config.get("playwright_dir", "~/my_claude_automations/playwright")).expanduser()
+    playwright_dir = Path(
+        config.get("playwright_dir", "~/my_claude_automations/playwright")
+    ).expanduser()
 
-    # Run tests
-    start = time.time()
+    # Determine run command — EEC overrides defaults
+    eec_cmd = eec.get("execution", {}).get("test_command")
     if strategy == "playwright":
-        cmd = ["npm", "test"]
-        test_cwd = playwright_dir
+        cmd, test_cwd = ["npm", "test"], playwright_dir
     elif strategy == "pytest":
-        cmd = ["pytest", "--tb=short", "-v"]
-        test_cwd = cwd
+        cmd, test_cwd = eec_cmd or ["pytest", "--tb=short", "-v"], cwd
     elif strategy == "combined":
-        cmd = ["pytest", "--tb=short", "-v"]
-        test_cwd = cwd
+        cmd, test_cwd = eec_cmd or ["pytest", "--tb=short", "-v"], cwd
     elif test_command:
-        cmd = test_command
-        test_cwd = cwd
+        cmd, test_cwd = test_command, cwd
     else:
-        cmd = ["pytest", "--tb=short", "-v"]
-        test_cwd = cwd
+        cmd, test_cwd = eec_cmd or ["pytest", "--tb=short", "-v"], cwd
 
+    start = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=test_cwd)
     duration = round(time.time() - start, 1)
     exit_code = result.returncode
     stdout = result.stdout[-3000:]
     stderr = result.stderr[-1000:]
 
-    # Send to inspector for behavioral evaluation
-    system = load_agent_prompt(config, "inspector")
+    system = inject_eec(load_agent_prompt(config, "inspector"), eec)
     prompt = (
         f"Tests ran. Exit code: {exit_code}. Duration: {duration}s.\n\n"
         f"STDOUT (last 3000 chars):\n{stdout}\n\n"
@@ -457,9 +822,11 @@ def phase_qa_evaluation(client, config, strategy, test_command, cwd, pid, log_di
 
     passed = "QA_VERDICT: PASS" in qa_report or exit_code == 0
 
-    sidecar["phase"] = f"QA_{iteration}_DONE"
-    sidecar["qa_report"] = qa_report
-    sidecar["last_exit_code"] = exit_code
+    sidecar.update({
+        "phase": f"QA_{iteration}_DONE",
+        "qa_report": qa_report,
+        "last_exit_code": exit_code,
+    })
     write_sidecar(plan, sidecar)
 
     if passed:
@@ -490,20 +857,18 @@ def phase_git_commit(agreed_plan, feature_tag, written_files, passed, cwd,
     assert_lock(plan, log_dir, pid)
 
     status = "passing" if passed else "partial"
-    summary = agreed_plan[:72]
-    commit_msg = f"feat: {summary} [{status}] {feature_tag}"
+    commit_msg = f"feat: {agreed_plan[:72]} [{status}] {feature_tag}"
 
     subprocess.run(["git", "-C", str(cwd), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(cwd), "commit", "-m", commit_msg], check=True)
 
-    # Open VS Code diffs
     vscode_diff = Path(config.get("vscode_diff_script", "")).expanduser()
     if vscode_diff.exists():
         subprocess.run(["bash", str(vscode_diff)], cwd=cwd)
 
     diff_stat = subprocess.run(
         ["git", "-C", str(cwd), "diff", "--stat", "HEAD~1", "HEAD"],
-        capture_output=True, text=True
+        capture_output=True, text=True,
     ).stdout
 
     sidecar["phase"] = "COMMITTED"
@@ -528,18 +893,19 @@ def archive_plan(plan: Path, log_dir: Path, pid: int, partial: bool = False):
 
 
 def phase_deliver(agreed_plan, strategy, written_files, passed, qa_report,
-                  iteration, max_iterations, pid, log_dir, plan):
+                  iteration, max_iterations, scope_type, pid, log_dir, plan):
     phase_start(pid, log_dir, "8/8", "DELIVER")
 
     result_str = "PASSED ✓" if passed else f"PARTIAL — {iteration}/{max_iterations} iterations"
-    banner("LIGHTS-OUT FACTORY — DELIVERY COMPLETE")
+    banner("FACTORY — DELIVERY COMPLETE")
     print(f"""
 {'=' * 62}
 DELIVERY REPORT
 {'=' * 62}
 Result:     {result_str}
+Scope:      {scope_type}
 Iterations: {iteration}/{max_iterations}
-Strategy:   {plan.parent.name}
+Strategy:   {strategy}
 Files:      {chr(10).join('  ' + f for f in written_files)}
 Git:        committed locally — PUSH PENDING YOUR APPROVAL
 
@@ -551,6 +917,7 @@ QA Report:
     archive_plan(plan, log_dir, pid, partial=not passed)
     write_status(pid, f"COMPLETE | {result_str}")
 
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -558,6 +925,7 @@ QA Report:
 def main():
     parser = argparse.ArgumentParser(description="lights-out factory orchestrator")
     parser.add_argument("--plan", required=True, help="Path to IP_ plan file")
+    parser.add_argument("--config", help="Path to factory_config.json (optional override)")
     args = parser.parse_args()
 
     plan = Path(args.plan).resolve()
@@ -565,38 +933,45 @@ def main():
         print(f"[factory] ERROR: plan file not found: {plan}")
         sys.exit(1)
 
-    config = load_config()
-    max_iterations = config.get("max_iterations", 3)
+    config_path = Path(args.config) if args.config else None
+    config = load_config(config_path)
     cwd = Path(config.get("repo_root", ".")).resolve()
     pid = os.getpid()
 
-    # Log directory per plan
+    # Load EEC — hard stop if missing
+    eec = load_eec(config)
+
+    # Maturity gate
+    if not maturity_check(eec, cwd):
+        print("[factory] Aborted at maturity gate.")
+        sys.exit(0)
+
+    # Extract scope from plan
+    plan_content = plan.read_text()
+    scope_type = extract_scope_type(plan_content)
+    max_iterations = SCOPE_ITERATIONS.get(scope_type, config.get("max_iterations", 3))
+
     plan_stem = plan.name.replace("IP_", "").replace(".prd.md", "")
     log_dir = Path(config.get("log_dir", "claude/factory/logs")).resolve() / plan_stem
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    banner("LIGHTS-OUT FACTORY — STARTING")
+    banner(f"FACTORY — STARTING  |  {cwd.name}  |  scope: {scope_type}  |  maturity: {eec.get('maturity')}")
     print(f"\033[0;37m  Watch: watch cat /tmp/factory-{pid}.txt\033[0m")
     print(f"\033[0;37m  Log:   {log_dir}/run.log\033[0m\n")
     write_status(pid, "STARTING")
 
-    # Check git
     git_check = subprocess.run(
         ["git", "-C", str(cwd), "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True
+        capture_output=True,
     )
     is_git = git_check.returncode == 0
 
-    # Handle dirty plan
     if sidecar_path(plan).exists():
         handle_dirty_plan(plan, cwd, log_dir, pid)
 
-    # Acquire lock
     write_lock(plan)
-    log(log_dir, f"Lock acquired. PID={pid}")
+    log(log_dir, f"Lock acquired. PID={pid}. scope={scope_type} max_iter={max_iterations}")
 
-    # Init sidecar
-    plan_content = plan.read_text()
     sidecar = {
         "pid": pid,
         "plan": str(plan),
@@ -605,30 +980,26 @@ def main():
         "iteration": 0,
         "strategy": None,
         "feature_tag": None,
+        "scope_type": scope_type,
     }
     write_sidecar(plan, sidecar)
 
     client = anthropic.Anthropic()
 
     try:
-        # Phase 1 — Plan negotiation
         agreed_plan = phase_plan_negotiation(
-            client, config, plan_content, pid, log_dir, sidecar, plan)
+            client, config, eec, plan_content, scope_type, pid, log_dir, sidecar, plan)
 
-        # Phase 2 — Strategy
         strategy = phase_strategy_detection(
-            agreed_plan, plan_content, pid, log_dir, sidecar, plan)
+            agreed_plan, plan_content, eec, pid, log_dir, sidecar, plan)
 
-        # Phase 2.5 — Feature tag
         feature_tag = phase_feature_tag(
             agreed_plan, pid, log_dir, sidecar, plan)
 
-        # Phase 3 — Test plan (private)
-        test_summary, test_files, test_command = phase_test_plan(
-            client, config, agreed_plan, strategy, feature_tag,
+        _test_summary, _test_files, test_command = phase_test_plan(
+            client, config, eec, agreed_plan, strategy, feature_tag,
             pid, log_dir, sidecar, plan, cwd)
 
-        # Implement → test loop
         passed = False
         qa_report = ""
         feedback = ""
@@ -638,41 +1009,36 @@ def main():
             sidecar["iteration"] = iteration
             write_sidecar(plan, sidecar)
 
-            # Phase 4 — Implement
             written_files = phase_implement(
-                client, config, agreed_plan, feedback, iteration,
-                pid, log_dir, sidecar, plan, cwd)
+                client, config, eec, agreed_plan, feedback, scope_type,
+                iteration, pid, log_dir, sidecar, plan, cwd)
 
-            # Phase 4.5 — Preflight
             preflight_result = phase_preflight(config, pid, log_dir, sidecar, plan)
-            if preflight_result == -1:  # user chose skip
+            if preflight_result == -1:
                 break
 
-            # Phase 5 — QA
             passed, qa_report = phase_qa_evaluation(
-                client, config, strategy, test_command, cwd,
+                client, config, eec, strategy, test_command, cwd,
                 pid, log_dir, sidecar, plan, iteration)
 
             if passed:
                 break
 
-            # Phase 6 — Feedback (if iterations remain)
             if iteration < max_iterations:
-                phase_start(pid, log_dir, "6/8", f"FEEDBACK LOOP iteration {iteration}/{max_iterations}")
+                phase_start(pid, log_dir, "6/8",
+                            f"FEEDBACK LOOP iteration {iteration}/{max_iterations}")
                 feedback = sanitize_feedback(qa_report)
                 log(log_dir, f"Sanitized feedback:\n{feedback}")
                 phase_done(pid, log_dir, "6/8")
 
-        # Phase 7 — Commit
         if is_git:
             phase_git_commit(
                 agreed_plan, feature_tag, written_files, passed,
                 cwd, config, pid, log_dir, sidecar, plan)
 
-        # Phase 8 — Deliver
         phase_deliver(
             agreed_plan, strategy, written_files, passed, qa_report,
-            iteration, max_iterations, pid, log_dir, plan)
+            iteration, max_iterations, scope_type, pid, log_dir, plan)
 
     except KeyboardInterrupt:
         log(log_dir, "Interrupted by user")

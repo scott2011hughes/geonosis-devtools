@@ -7,6 +7,7 @@
   "repo_root": "{repo_root}",
   "agent_dir": "{repo_root}/.claude/agents",
   "log_dir": "{repo_root}/.claude/factory/logs",
+  "eec_path": "{repo_root}/{repo_name}_eec.json",
   "playwright_dir": "~/my_claude_automations/playwright",
   "healthcheck_script": "~/my_claude_automations/healthcheck.sh",
   "vscode_diff_script": "{repo_root}/.claude/hooks/vscode-diff.sh"

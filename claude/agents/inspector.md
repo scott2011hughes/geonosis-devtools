@@ -29,39 +29,36 @@ something can fail, mark it as a risk and test it.
 4. **Report failures** in behavioral terms only — no test internals ever
    reach the builder
 
-## VAULT IMPORT RULE — NON-NEGOTIABLE
+## EEC Import Rule — NON-NEGOTIABLE
 
-`services/shared/resources/config.py` reads a vault file **at import time** (module level).
-Any import that transitively reaches it will cause pytest to fail at collection with 0 tests collected.
+The EEC block passed in your prompt contains `canonical_entry_points` and
+`imports.forbidden_module_level`. Any import matching these at module level will
+cause the same class of failure as a vault read at collection time (0 tests collected,
+silent failure, hard to diagnose).
 
-**The chain that kills collection:**
-```
-from shared.resources.deploy import ...       ← triggers →
-  shared/resources/task.py                    ← triggers →
-    shared/resources/mongodb.py               ← triggers →
-      shared/resources/config.py              ← READS VAULT → FileNotFoundError
-```
+### The rule
 
-### The rule is simple:
-
-**NEVER put `from shared.resources.*` at the top of a test file.**
-
-Import from `shared.resources.*` only inside fixture bodies or test function bodies — never at module level.
+**NEVER put a `canonical_entry_points` forbidden import, or any module in
+`imports.forbidden_module_level`, at the top of a test file.**
+Import them only inside fixture bodies or test function bodies.
 
 ```python
-# ❌ FORBIDDEN — kills collection
-from shared.resources.deploy import POST_DEPLOY_TASK
+# Given EEC: canonical_entry_points.mongodb.forbidden_imports = ["pymongo"]
+
+# ❌ FORBIDDEN — may kill collection or cause credential failure
+import pymongo
 
 # ✅ CORRECT — import inside test function
 def test_something():
-    from shared.resources.deploy import POST_DEPLOY_TASK
-    assert POST_DEPLOY_TASK == "tasks.post_deploy"
+    from shared.resources.mongodb import get_mongodb
+    db = get_mongodb()
+    ...
 
-# ✅ ALSO CORRECT — import inside fixture
+# ✅ CORRECT — import inside fixture
 @pytest.fixture
-def post_deploy_task():
-    from shared.resources.deploy import POST_DEPLOY_TASK
-    return POST_DEPLOY_TASK
+def db():
+    from shared.resources.mongodb import get_mongodb
+    return get_mongodb()
 ```
 
 ### Mandatory self-check before outputting any test file
@@ -69,11 +66,11 @@ def post_deploy_task():
 Before writing your JSON output, scan every test file you have written.
 For each file, confirm:
 
-- [ ] No `from shared.resources.*` appears at the top of the file (outside functions/fixtures)
-- [ ] No `from shared.models.*` that transitively imports `shared.resources.config`
-- [ ] `from shared.models.talosflux import ...` and `from shared.models.user import ...` are safe (they do NOT trigger vault)
+- [ ] No `canonical_entry_points[*].forbidden_imports` entry appears at module level
+- [ ] No module in `imports.forbidden_module_level` appears at module level
+- [ ] No relative traversal imports (`from ..`) anywhere in the file
 
-If any test file fails this check, fix it before outputting.
+If any file fails this check, fix it before outputting.
 
 ## Before Writing Tests
 
@@ -144,11 +141,20 @@ Output all test files in a single JSON block, then the sentinel:
     "tests/test_feature.py": "complete file content",
     "playwright/feature.spec.js": "complete spec content"
   },
-  "command": ["pytest", "--tb=short", "-v"]
+  "command": ["pytest", "--tb=short", "-v"],
+  "scaffold_requests": [
+    {
+      "path": "tests/integration/workers/",
+      "type": "directory",
+      "reason": "integration tier for worker tests required but not present on disk"
+    }
+  ]
 }
 ```
 
-`command` is only required for `custom` strategy. Then output:
+`command` is only required for `custom` strategy. `scaffold_requests` is optional — include it only when the EEC `scaffold_policy.qa_can_request` is true and required test structure does not exist on disk. The orchestrator will gate on this with a Y/N/Instead prompt before creating anything.
+
+Then output:
 
 ```
 TEST_PLAN_READY: <brief description of behaviors tested and edge cases covered>
