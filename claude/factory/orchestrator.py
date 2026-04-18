@@ -9,9 +9,11 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -25,6 +27,28 @@ import anthropic
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).parent / "factory_config.json"
+
+# ---------------------------------------------------------------------------
+# Run-state — module-level; atexit handler reads this on any process exit
+# ---------------------------------------------------------------------------
+
+_run_state: dict = {
+    "initialized": False,
+    "cwd": None,
+    "log_dir": None,
+    "pid": None,
+    "written_files": [],
+    "passed": None,
+    "qa_report": "",
+    "iteration": 0,
+    "max_iterations": 0,
+    "scope_type": "unknown",
+    "strategy": "unknown",
+    "feature_tag": "",
+    "last_error": None,
+    "delivered": False,       # set True by phase_deliver on normal completion
+    "committed": False,       # set True after git commit
+}
 
 def load_config(config_path: Path | None = None) -> dict:
     path = config_path or CONFIG_PATH
@@ -873,6 +897,35 @@ def phase_qa_evaluation(client, config, eec, strategy, test_command, cwd,
     return passed, qa_report
 
 
+_COMMIT_PREAMBLE = re.compile(
+    r"^(?:"
+    r"I(?:'ll| will| am going to| will be| will now)\s+"
+    r"|(?:This|The|We|The\s+implementation|This\s+change|The\s+change)"
+    r"(?:\s+will(?:\s+be)?)?\s+"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def normalize_commit_subject(text: str) -> str:
+    """
+    Turn a builder PLAN_AGREED paragraph into an imperative commit subject.
+    'I will add X to Y. Also refactor Z.' -> 'add X to Y'
+    """
+    # First sentence only
+    first = re.split(r"[.\n]", text)[0].strip()
+    # Strip first-person / future-tense opener, repeatedly (handles 'I will now add')
+    for _ in range(3):
+        stripped = _COMMIT_PREAMBLE.sub("", first).strip()
+        if stripped == first:
+            break
+        first = stripped
+    # Conventional commits want lowercase after the type prefix
+    if first:
+        first = first[0].lower() + first[1:]
+    return first[:72]
+
+
 def sanitize_feedback(qa_report: str) -> str:
     """Strip test internals — only behavioral descriptions reach the builder."""
     lines = []
@@ -893,7 +946,7 @@ def phase_git_commit(agreed_plan, feature_tag, _written_files, passed, cwd,
     assert_lock(plan, log_dir, pid)
 
     status = "passing" if passed else "partial"
-    commit_msg = f"feat: {agreed_plan[:72]} [{status}] {feature_tag}"
+    commit_msg = f"feat: {normalize_commit_subject(agreed_plan)} [{status}] {feature_tag}"
 
     subprocess.run(["git", "-C", str(cwd), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(cwd), "commit", "-m", commit_msg], check=True)
@@ -929,6 +982,148 @@ def archive_plan(plan: Path, log_dir: Path, pid: int, _partial: bool = False):
     log(log_dir, f"Archived to {done_name}")
 
 
+# ---------------------------------------------------------------------------
+# Delivery report — posted as a new Claude session on any process exit
+# ---------------------------------------------------------------------------
+
+def _is_test_file(path: str) -> bool:
+    p = Path(path)
+    return (
+        p.name.startswith("test_")
+        or p.name.endswith("_test.py")
+        or "/tests/" in path
+        or path.startswith("tests/")
+        or "/test/" in path
+    )
+
+
+def build_session_report() -> str:
+    s = _run_state
+    if not s.get("initialized"):
+        return ""
+
+    cwd = s.get("cwd")
+    written = s.get("written_files", [])
+    test_files = [f for f in written if _is_test_file(f)]
+    impl_files = [f for f in written if not _is_test_file(f)]
+
+    passed = s.get("passed")
+    if passed is True:
+        verdict = "PASSED"
+    elif passed is False:
+        iters = s.get("iteration", 0)
+        max_i = s.get("max_iterations", 0)
+        verdict = f"FAILED — {iters}/{max_i} iterations exhausted"
+    else:
+        verdict = "INCOMPLETE (exited before QA)"
+
+    # Git diff --stat: prefer committed range, fall back to unstaged
+    diff_stat = ""
+    if cwd:
+        try:
+            if s.get("committed"):
+                r = subprocess.run(
+                    ["git", "-C", str(cwd), "diff", "--stat", "HEAD~1", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                )
+            else:
+                r = subprocess.run(
+                    ["git", "-C", str(cwd), "diff", "--stat", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                )
+            if r.returncode == 0 and r.stdout.strip():
+                diff_stat = r.stdout.strip()
+        except Exception:
+            pass
+
+    log_dir = s.get("log_dir", "")
+    log_file = str(Path(log_dir) / "run.log") if log_dir else ""
+
+    sep = "-" * 62
+    lines = [
+        sep,
+        "FACTORY DELIVERY REPORT",
+        sep,
+        f"Verdict:    {verdict}",
+        f"Scope:      {s.get('scope_type', 'unknown')}",
+        f"Iterations: {s.get('iteration', 0)}/{s.get('max_iterations', 0)}",
+        f"Strategy:   {s.get('strategy', 'unknown')}",
+        f"Tag:        {s.get('feature_tag', '')}",
+        f"Log:        {log_file}",
+        "",
+    ]
+
+    if impl_files:
+        lines.append(f"Files written ({len(impl_files)}):")
+        for f in impl_files:
+            lines.append(f"  {f}")
+    else:
+        lines.append("Files written: none")
+
+    if test_files:
+        lines.append(f"\nTests introduced ({len(test_files)}):")
+        for f in test_files:
+            lines.append(f"  {f}")
+
+    if diff_stat:
+        lines.append(f"\nGit diff --stat:\n{diff_stat}")
+
+    if s.get("last_error"):
+        lines.append(f"\nError:\n  {s['last_error']}")
+
+    if passed is not True and s.get("qa_report"):
+        qa_tail = "\n".join(s["qa_report"].splitlines()[-20:])
+        lines.append(f"\nQA Report (tail):\n{qa_tail}")
+
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def post_session_report():
+    """
+    atexit handler — fires on normal exit, sys.exit(), unhandled exception,
+    KeyboardInterrupt, and SIGTERM (via signal handler below).
+    Overwrites /tmp/factory-{pid}.txt with the full delivery report so
+    the caller's `watch cat` watcher picks it up immediately.
+    """
+    if not _run_state.get("initialized"):
+        return
+
+    report = build_session_report()
+    if not report:
+        return
+
+    # Overwrite the status file — the caller's watcher sees this instantly
+    pid = _run_state.get("pid")
+    if pid:
+        try:
+            status_path(pid).write_text(report + "\n")
+        except Exception:
+            pass
+
+    # Persist to log_dir for later reference
+    log_dir = _run_state.get("log_dir")
+    if log_dir:
+        try:
+            Path(log_dir).joinpath("delivery_report.txt").write_text(report + "\n")
+        except Exception:
+            pass
+
+    # On abnormal exit the deliver banner never ran — print to terminal too
+    if not _run_state.get("delivered"):
+        print(f"\n{report}\n")
+
+
+def _sigterm_handler(_signum, _frame):
+    """Convert SIGTERM to a normal Python exit so atexit handlers fire."""
+    _run_state["last_error"] = "Terminated (SIGTERM)"
+    sys.exit(1)
+
+
+atexit.register(post_session_report)
+signal.signal(signal.SIGTERM, _sigterm_handler)
+
+
 def phase_deliver(strategy, written_files, passed, qa_report,
                   iteration, max_iterations, scope_type, pid, log_dir, plan):
     phase_start(pid, log_dir, "8/8", "DELIVER")
@@ -951,6 +1146,7 @@ QA Report:
 {'=' * 62}
 """)
 
+    _run_state["delivered"] = True
     archive_plan(plan, log_dir, pid, partial=not passed)
     write_status(pid, f"COMPLETE | {result_str}")
 
@@ -992,6 +1188,16 @@ def main():
     log_dir = Path(config.get("log_dir", "claude/factory/logs")).resolve() / plan_stem
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Seed run-state so atexit handler has context from this point forward
+    _run_state.update({
+        "initialized": True,
+        "cwd": str(cwd),
+        "log_dir": str(log_dir),
+        "pid": pid,
+        "scope_type": scope_type,
+        "max_iterations": max_iterations,
+    })
+
     banner(f"FACTORY — STARTING  |  {cwd.name}  |  scope: {scope_type}  |  maturity: {eec.get('maturity')}")
     print(f"\033[0;37m  Watch: watch cat /tmp/factory-{pid}.txt\033[0m")
     print(f"\033[0;37m  Log:   {log_dir}/run.log\033[0m\n")
@@ -1029,26 +1235,31 @@ def main():
 
         strategy = phase_strategy_detection(
             agreed_plan, plan_content, eec, pid, log_dir, sidecar, plan)
+        _run_state["strategy"] = strategy
 
         feature_tag = phase_feature_tag(
             agreed_plan, pid, log_dir, sidecar, plan)
+        _run_state["feature_tag"] = feature_tag
 
-        _test_summary, _test_files, test_command = phase_test_plan(
+        test_command = phase_test_plan(
             client, config, eec, agreed_plan, strategy, feature_tag,
-            pid, log_dir, sidecar, plan, cwd)
+            pid, log_dir, sidecar, plan, cwd)[2]
 
         passed = False
         qa_report = ""
         feedback = ""
         written_files = []
+        iteration = 0
 
         for iteration in range(1, max_iterations + 1):
+            _run_state["iteration"] = iteration
             sidecar["iteration"] = iteration
             write_sidecar(plan, sidecar)
 
             written_files = phase_implement(
                 client, config, eec, agreed_plan, feedback, scope_type,
                 iteration, pid, log_dir, sidecar, plan, cwd)
+            _run_state["written_files"] = written_files
 
             preflight_result = phase_preflight(config, pid, log_dir, sidecar, plan)
             if preflight_result == -1:
@@ -1057,6 +1268,8 @@ def main():
             passed, qa_report = phase_qa_evaluation(
                 client, config, eec, strategy, test_command, cwd,
                 pid, log_dir, sidecar, plan, iteration)
+            _run_state["passed"] = passed
+            _run_state["qa_report"] = qa_report
 
             if passed:
                 break
@@ -1072,16 +1285,19 @@ def main():
             phase_git_commit(
                 agreed_plan, feature_tag, written_files, passed,
                 cwd, config, pid, log_dir, sidecar, plan)
+            _run_state["committed"] = True
 
         phase_deliver(
             strategy, written_files, passed, qa_report,
             iteration, max_iterations, scope_type, pid, log_dir, plan)
 
     except KeyboardInterrupt:
+        _run_state["last_error"] = "Interrupted by user (KeyboardInterrupt)"
         log(log_dir, "Interrupted by user")
         release_lock(plan)
         sys.exit(1)
     except Exception as e:
+        _run_state["last_error"] = str(e)
         log(log_dir, f"FATAL: {e}")
         phase_fail(pid, log_dir, "FATAL", str(e))
         release_lock(plan)
