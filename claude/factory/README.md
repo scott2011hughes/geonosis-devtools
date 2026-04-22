@@ -38,7 +38,9 @@ Copy files to these exact paths under your repo root:
   skills/
     grill-me/SKILL.md
     write-a-prd/SKILL.md
-    prd-to-issues/SKILL.md
+    prd-to-tasks/SKILL.md
+    integrate-with-gh/SKILL.md
+    integrate-with-jira/SKILL.md
 ```
 
 ### Create directories
@@ -52,7 +54,9 @@ mkdir -p .claude/agents
 mkdir -p .claude/commands
 mkdir -p .claude/skills/grill-me
 mkdir -p .claude/skills/write-a-prd
-mkdir -p .claude/skills/prd-to-issues
+mkdir -p .claude/skills/prd-to-tasks
+mkdir -p .claude/skills/integrate-with-gh
+mkdir -p .claude/skills/integrate-with-jira
 ```
 
 ### Make orchestrator executable
@@ -82,6 +86,21 @@ Edit these values for your environment if required:
 ```
 
 Set `max_iterations` to 5 if the PRD's Definition of Done warrants it.
+
+### Generate your EEC config
+
+The EEC (Execution Environment Contract) tells the factory how your repo is structured: test paths, forbidden writes, import rules, and execution commands. A template lives at `.claude/factory/eec.template.json`.
+
+**Don't fill it by hand.** Instead, ask Claude:
+
+> "Read `.claude/factory/orchestrator.py` and scan this repo's structure, then suggest values for each field in `eec.template.json`. Write the result to `{repo_name}_eec.json`."
+
+Claude will read the orchestrator to understand every field's purpose, then scan your actual test layout, import conventions, and entry points — producing a populated file you review and adjust rather than author from scratch.
+
+Key points:
+- `test_strategy` (`pytest` / `playwright` / `combined`) belongs in each **PRD's JSON contract block**, not in the EEC. The EEC `test_command` is a pytest runtime invocation only.
+- `playwright_command` lives in `factory_config.json`, not the EEC.
+- Set `maturity: "established"` only after you've manually confirmed the test suite runs end-to-end.
 
 ### Verify installation
 
@@ -150,6 +169,9 @@ Every issue entering the factory must satisfy these fields. The `intake` agent s
 | `constraints` | HIPAA, security, perf, API contracts — or explicitly "none" |
 | `out_of_scope` | At least one explicit exclusion |
 | `definition_of_done` | Exit condition — when does the orchestrator commit? |
+| `scope_type` | `surgical_fix` / `feature_add` / `refactor` / `new_domain` — drives iteration budget |
+| `test_strategy` | `pytest` / `playwright` / `combined` — drives inspector and QA phase |
+| `estimated_files` | Complete write scope — builder may only touch listed files |
 | `open_questions` | Must be **empty** before handoff to orchestrator |
 
 ---
@@ -162,8 +184,14 @@ Interviews you one question at a time until open questions are empty. Outputs st
 ### `write-a-prd` (Sonnet)
 Takes grill-me JSON and synthesizes a formal PRD. Explores codebase, identifies deep modules. Outputs to `staging/` — never directly to an API.
 
-### `prd-to-issues` / `prd-to-plan`
-Breaks PRD into tracer bullet vertical slices. Each slice is AFK or HITL. Creates issues in dependency order. Output goes to staging for review before any API call.
+### `prd-to-tasks`
+Breaks a PRD into tracer-bullet vertical slices saved as a local `.claude/planning/` file. Each phase carries its own contract JSON block (`scope_type`, `test_strategy`, `estimated_files`) so it can be handed directly to `/factory`. Does NOT own decomposition for integration targets — use `integrate-with-gh` or `integrate-with-jira` to publish the approved breakdown.
+
+### `integrate-with-gh`
+Mechanical GitHub operations: list issues, view PRs, create issues, comment, close. Publishes an approved `prd-to-tasks` breakdown as GitHub issues in dependency order. Does not own decomposition.
+
+### `integrate-with-jira`
+Mechanical Jira operations: fetch tickets, list open issues, comment, transition status, take ownership. Publishes an approved `prd-to-tasks` breakdown as Jira stories. Credentials from `$JIRA_URL`, `$JIRA_EMAIL`, `$JIRA_API_TOKEN` — never hardcoded.
 
 ### `intake` (Haiku)
 Scores a staging file or live issue against the PRD contract. Routes to grill-me if gaps found. Never auto-promotes.
@@ -217,21 +245,22 @@ flowchart TD
     style H fill:#0F6E56,color:#9FE1CB
 ```
 
-### Workflow 3 — PRD to issue breakdown
+### Workflow 3 — PRD to task breakdown and publish
 
 ```mermaid
 flowchart TD
-    A([PRD issue or\nstaging file]) --> B[prd-to-issues\nSonnet]
-    B --> C[draft vertical slices\nAFK / HITL\ndependency order]
+    A([PRD issue or\nstaging file]) --> B[prd-to-tasks]
+    B --> C[draft vertical slices\nAFK / HITL\ndependency order\neach with contract JSON]
     C --> D{{YOU REVIEW\ngranularity + deps}}
     D -- revise --> C
-    D -- approved --> E[write issues to\nstaging/ in order]
-    E --> F{{YOU REVIEW\neach slice}}
-    F -- promote --> G([create issue\nready-for-factory])
-    F -- revise --> E
+    D -- approved --> E{publish where?}
+    E -- GitHub --> F[integrate-with-gh\ncreate issues in order]
+    E -- Jira --> G[integrate-with-jira\ncreate stories in order]
+    E -- factory only --> H([/factory per phase])
+    F --> H
+    G --> H
     style D fill:#854F0B,color:#FAC775
-    style F fill:#854F0B,color:#FAC775
-    style G fill:#0F6E56,color:#9FE1CB
+    style H fill:#0F6E56,color:#9FE1CB
 ```
 
 ### Workflow 4 — Orchestrator run
@@ -288,7 +317,7 @@ flowchart TD
 | Gate | What you decide |
 |------|----------------|
 | staging → inbox | is this spec good enough to run? |
-| prd-to-issues review | is the slice granularity right? |
+| prd-to-tasks review | is the slice granularity right? |
 | intake INTAKE_GAP | fill holes or rewrite? |
 | pre-flight exit 2 | fix infrastructure or skip tests? |
 | post-commit diff | push or revert? |

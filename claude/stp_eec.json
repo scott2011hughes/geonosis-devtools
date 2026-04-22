@@ -1,0 +1,96 @@
+{
+  "repo": "stp",
+  "maturity": "established",
+
+  "paths": {
+    "app_root": "backend/app",
+    "_app_root_note": "pythonpath=backend so imports are from app.*. Write files as backend/app/core/x.py — never backend/app/app/.",
+    "tests_root": "tests",
+    "test_tiers": {
+      "unit_pytest": "tests/unit/pytest",
+      "unit_playwright": "tests/unit/playwright",
+      "e2e_playwright": "tests/e2e/playwright",
+      "e2e_py": "tests/e2e/py"
+    }
+  },
+
+  "imports": {
+    "allowed_roots": ["app"],
+    "forbidden_import_roots": ["psycopg2"],
+    "forbid_relative_traversal": true,
+    "forbidden_module_level": [],
+    "stdlib_passthrough": true,
+    "third_party_passthrough": true
+  },
+
+  "canonical_entry_points": {
+    "database_session": {
+      "use": "from app.core.db import get_db",
+      "forbidden_imports": ["psycopg2", "psycopg2.extras"],
+      "reason": "Route handlers must use get_db() as a FastAPI dependency — it executes SET search_path per request for schema-per-tenant isolation. Direct psycopg2 or SessionLocal bypasses tenant routing entirely."
+    },
+    "settings_singleton": {
+      "use": "from app.core.config import get_settings",
+      "forbidden_imports": [],
+      "reason": "Always use get_settings() (lru_cache singleton). Directly instantiating Settings() creates a second instance and ignores .env overrides in test environments."
+    }
+  },
+
+  "filesystem": {
+    "allowed_write": [],
+    "forbidden_write": [
+      "pytest.ini",
+      "pyproject.toml",
+      "setup.cfg",
+      "conftest.py",
+      ".env",
+      ".env.example",
+      "docker-compose.yml",
+      "docker-compose-scott.yml",
+      "docker-compose-patrick.yml",
+      "docker-compose-tyler.yml",
+      "docker-compose-base.yml",
+      "backend/app/core/config.py",
+      "backend/app/main.py",
+      "backend/app/__init__.py",
+      "backend/app/models/__init__.py",
+      "backend/app/models/appointment.py",
+      "backend/app/core/db.py"
+    ]
+  },
+
+  "scaffold_policy": {
+    "qa_can_request": true,
+    "requires_user_approval": true,
+    "must_match_test_tiers": true
+  },
+
+  "conftest_policy": {
+    "root_immutable": true,
+    "domain_conftest_requires_approval": true,
+    "local_fixtures_preferred": true
+  },
+
+  "execution": {
+    "test_command": ["bash", "-c", "backend/.venv/bin/pip install -q -r backend/requirements.txt && backend/.venv/bin/python -m pytest --tb=short -v"],
+    "deploy_command": null,
+    "_deploy_command_note": "Set to 'docker compose up --build -d' when integration tests need a live DB. null = unit-only mode (TestClient, no Docker required).",
+    "services": {
+      "backend": {
+        "path": "backend/",
+        "deploy_target": "backend"
+      }
+    },
+    "_services_note": "backend service maps to docker compose target 'backend'. Used when deploy_command is set for integration test runs."
+  },
+
+  "rules": {
+    "tests_are_oracle": true,
+    "tests_not_editable": true,
+    "phi_never_logged": true,
+    "tenant_isolation_required": true,
+    "unowned_files": "Files NOT listed in the PRD estimated_files are read-only. You may read them for context. You may never write, edit, or include them in your output JSON. If solving the feature seems to require modifying an unowned file, re-read your scope — the answer is in your scoped files."
+  },
+
+  "scope_hint": null
+}

@@ -1,11 +1,13 @@
 ---
-name: prd-to-plan
-description: Turn a PRD into a multi-phase implementation plan using tracer-bullet vertical slices, saved as a local Markdown file in ./claude/planning. Use when user wants to break down a PRD, create an implementation plan, plan phases from a PRD, or mentions "tracer bullets".
+name: prd-to-tasks
+description: Turn a PRD into a phased local task plan using tracer-bullet vertical slices, saved as a Markdown file in .claude/planning/. Use when user wants to break down a PRD into local tasks, create a phased implementation plan, or plan work before handing to the factory.
 ---
 
-# PRD to Plan
+# PRD to Tasks
 
-Break a PRD into a phased implementation plan using vertical slices (tracer bullets). Output is a Markdown file in `./claude/planning`.
+Break a PRD into a phased implementation plan using vertical slices (tracer bullets). Output is a Markdown file in `.claude/planning/`.
+
+Each output phase is a factory-ready slice: it carries its own `scope_type`, `test_strategy`, and `estimated_files` so it can be handed directly to `/factory` or published via `integrate-with-gh` / `integrate-with-jira`.
 
 ## Process
 
@@ -57,7 +59,9 @@ Iterate until the user approves the breakdown.
 
 ### 6. Write the plan file
 
-Create `./plans/` if it doesn't exist. Write the plan as a Markdown file named after the feature (e.g. `./plans/user-onboarding.md`). Use the template below.
+Create `.claude/planning/` if it doesn't exist. Write the plan as a Markdown file named after the feature (e.g. `.claude/planning/user-onboarding.md`). Use the template below.
+
+Each phase block must open with the factory contract JSON so it can be handed directly to `/factory` or an integration skill without manual editing.
 
 <plan-template>
 # Plan: <Feature Name>
@@ -67,6 +71,7 @@ Create `./plans/` if it doesn't exist. Write the plan as a Markdown file named a
 ## Scope
 
 - **Type**: `surgical_fix` | `feature_add` | `refactor` | `new_domain`
+- **Test strategy**: `pytest` | `playwright` | `combined`
 - **Touch radius**: ...
 - **Factory iterations**: (2 for surgical_fix / 3 for feature_add or refactor / 5 for new_domain)
 
@@ -82,6 +87,15 @@ Durable decisions that apply across all phases:
 ---
 
 ## Phase 1: <Title>
+
+```json
+{
+  "scope_type": "surgical_fix | feature_add | refactor | new_domain",
+  "test_strategy": "pytest | playwright | combined",
+  "feature": "phase-1-slug",
+  "estimated_files": ["path/to/file.py"]
+}
+```
 
 **User stories**: <list from PRD>
 

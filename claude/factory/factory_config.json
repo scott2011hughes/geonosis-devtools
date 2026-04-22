@@ -1,14 +1,23 @@
 {
   "models": {
-    "builder": "claude-sonnet-4-6",
+    "builder": "claude-opus-4-7",
     "inspector": "claude-haiku-4-5-20251001"
   },
   "max_iterations": 3,
-  "repo_root": "{repo_root}",
+  "repo_root": "/opt/apps/stp",
   "agent_dir": "{repo_root}/.claude/agents",
   "log_dir": "{repo_root}/.claude/factory/logs",
   "eec_path": "{repo_root}/{repo_name}_eec.json",
-  "playwright_dir": "~/my_claude_automations/playwright",
-  "healthcheck_script": "~/my_claude_automations/healthcheck.sh",
-  "vscode_diff_script": "{repo_root}/.claude/hooks/vscode-diff.sh"
+  "playwright_dir": "{repo_root}/tests/unit/playwright",
+  "healthcheck_script": "{repo_root}/.claude/factory/healthcheck.sh",
+  "vscode_diff_script": "{repo_root}/.claude/hooks/vscode-diff.sh",
+  "playwright_services": {
+    "frontend": {
+      "command": "npm --prefix frontend install && npm --prefix frontend run dev -- --host",
+      "health_url": "http://localhost:5173",
+      "poll_interval_s": 2,
+      "timeout_s": 60
+    }
+  },
+  "playwright_command": ["npx", "playwright", "test"]
 }

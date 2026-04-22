@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import atexit
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -144,7 +145,7 @@ STDLIB_ROOTS = frozenset({
 })
 
 
-def validate_file(rel_path: str, content: str, eec: dict) -> list[dict]:
+def validate_file(rel_path: str, content: str, eec: dict, estimated_files: list[str] | None = None) -> list[dict]:
     """
     Run all EEC checks against a single file before it hits disk.
     Returns a list of violation dicts (empty = valid).
@@ -168,7 +169,21 @@ def validate_file(rel_path: str, content: str, eec: dict) -> list[dict]:
                 "correction": f"'{rel_path}' matches eec.filesystem.forbidden_write — do not write this file",
             })
 
-    # 2. Allowed write paths (only enforced if list is non-empty)
+    # 2. Unowned file scope check (enforced when estimated_files provided)
+    if estimated_files is not None and eec.get("rules", {}).get("unowned_files"):
+        if rel_path not in estimated_files:
+            violations.append({
+                "file": rel_path,
+                "type": "OUT_OF_SCOPE",
+                "line": None,
+                "text": rel_path,
+                "correction": (
+                    f"'{rel_path}' is not in estimated_files — unowned files are read-only. "
+                    f"Remove it from your output. Scoped files: {estimated_files}"
+                ),
+            })
+
+    # 3. Allowed write paths (only enforced if list is non-empty)
     allowed_write = filesystem.get("allowed_write", [])
     if allowed_write:
         in_allowed = any(
@@ -431,7 +446,7 @@ def handle_dirty_plan(plan: Path, cwd: Path, log_dir: Path, pid: int):
     )
     if result.stdout.strip():
         log(log_dir, "Commit found — archiving and delivering without re-running")
-        archive_plan(plan, log_dir, pid, partial=True)
+        archive_plan(plan, log_dir, pid, _partial=True)
         print(f"\033[1;32m✔  Previous run committed successfully. Archived as done.\033[0m")
         sys.exit(0)
     else:
@@ -545,15 +560,20 @@ def phase_plan_negotiation(client, config, eec, plan_content, scope_type,
 def phase_strategy_detection(agreed_plan, plan_content, eec, pid, log_dir, sidecar, plan):
     phase_start(pid, log_dir, "2/8", "STRATEGY DETECTION")
 
-    # Use EEC test_command if set and non-default
-    eec_cmd = eec.get("execution", {}).get("test_command", [])
-    if eec_cmd and eec_cmd != ["pytest", "--tb=short", "-v"]:
-        strategy = "custom"
-        phase_done(pid, log_dir, "2/8", f"custom (from EEC: {eec_cmd})")
+    # PRD-declared test_strategy is authoritative — check it first.
+    # Prevents EEC custom test_command from masking playwright PRDs.
+    prd_json = extract_json_block(plan_content) or {}
+    declared = prd_json.get("test_strategy", "")
+    if declared in ("playwright", "combined", "pytest"):
+        strategy = declared
+        phase_done(pid, log_dir, "2/8", f"{strategy} (from PRD test_strategy)")
         sidecar.update({"phase": "STRATEGY_DONE", "strategy": strategy})
         write_sidecar(plan, sidecar)
         return strategy
 
+    # Fall back to keyword inference from agreed plan + plan content.
+    # EEC custom test_command applies at run-time in phase_qa_evaluation —
+    # it does not override strategy here, so playwright PRDs stay playwright.
     combined = (agreed_plan + plan_content).lower()
     if "playwright" in combined and ("pytest" in combined or "python test" in combined):
         strategy = "combined"
@@ -661,26 +681,41 @@ def phase_test_plan(client, config, eec, agreed_plan, strategy, feature_tag,
         if data:
             test_files = data.get("files", {})
 
+    # Inspector tests are staged to /tmp — never written directly to disk.
+    # The orchestrator copies them in before each pytest run and removes them after,
+    # so the builder cannot read them between iterations.
+    tmp_test_files = {}  # tmp_path -> (cwd_dest, content)
     for rel_path, content in test_files.items():
         if strategy == "playwright":
-            dest = playwright_dir / rel_path
+            # Strip playwright_dir prefix if inspector gave a repo-relative path
+            # (e.g. "tests/unit/playwright/foo.spec.ts" → "foo.spec.ts")
+            rel = Path(rel_path)
+            try:
+                rel = rel.relative_to(playwright_dir)
+            except ValueError:
+                pass
+            dest = playwright_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content)
         else:
-            dest = cwd / rel_path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content)
+            tmp_path = Path(f"/tmp/inspector_{pid}_{Path(rel_path).name}")
+            tmp_path.write_text(content)
+            tmp_test_files[str(tmp_path)] = (cwd / rel_path, content)
+            log(log_dir, f"Inspector test staged: {rel_path} → {tmp_path}")
 
     sidecar.update({
         "phase": "TEST_PLAN_DONE",
         "test_summary": test_summary or "test plan created",
         "test_command": test_command,
+        "tmp_test_files": {k: str(v[0]) for k, v in tmp_test_files.items()},
     })
     write_sidecar(plan, sidecar)
     phase_done(pid, log_dir, "3/8", test_summary or "")
-    return test_summary, test_files, test_command
+    return test_summary, tmp_test_files, test_command
 
 
 def phase_implement(client, config, eec, agreed_plan, feedback, scope_type,
-                    iteration, pid, log_dir, sidecar, plan, cwd):
+                    iteration, pid, log_dir, sidecar, plan, cwd, estimated_files=None):
     phase_start(pid, log_dir, "4/8", f"IMPLEMENT iteration {iteration}")
     assert_lock(plan, log_dir, pid)
 
@@ -712,7 +747,7 @@ def phase_implement(client, config, eec, agreed_plan, feedback, scope_type,
         # EEC validation — run before writing anything
         all_violations = []
         for rel_path, content in files_to_write.items():
-            violations = validate_file(rel_path, content, eec)
+            violations = validate_file(rel_path, content, eec, estimated_files)
             all_violations.extend(violations)
 
         if all_violations:
@@ -841,8 +876,90 @@ Fix the issues above, then:
     return exit_code
 
 
+@contextmanager
+def playwright_services_running(config: dict, cwd: Path, log_dir: Path):
+    """Start playwright_services declared in factory_config, yield, then kill them.
+
+    Starts only the services needed for scoped playwright tests (e.g. Vite dev
+    server). API calls are mocked via page.route() — no backend required.
+    Full-stack e2e (real API + DB) is the PR gate, not the factory loop.
+
+    Each service entry:  { "command": str, "health_url": str,
+                           "poll_interval_s": int, "timeout_s": int }
+    No-op when config has no playwright_services key.
+    """
+    services = config.get("playwright_services", {})
+    procs = []
+    try:
+        for name, svc in services.items():
+            cmd = svc.get("command", "")
+            if not cmd:
+                continue
+            log(log_dir, f"e2e service '{name}': starting — {cmd}")
+            proc = subprocess.Popen(
+                cmd, shell=True, cwd=cwd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            procs.append((name, proc))
+
+            health_url = svc.get("health_url")
+            timeout = svc.get("timeout_s", 60)
+            interval = svc.get("poll_interval_s", 2)
+            if health_url:
+                deadline = time.time() + timeout
+                import urllib.request
+                ready = False
+                while time.time() < deadline:
+                    try:
+                        urllib.request.urlopen(health_url, timeout=2)
+                        ready = True
+                        break
+                    except Exception:
+                        time.sleep(interval)
+                if ready:
+                    log(log_dir, f"e2e service '{name}': ready at {health_url}")
+                else:
+                    raise RuntimeError(
+                        f"e2e service '{name}' did not become healthy at "
+                        f"{health_url} within {timeout}s"
+                    )
+        yield
+    finally:
+        for name, proc in procs:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+            log(log_dir, f"e2e service '{name}': stopped (pid {proc.pid})")
+
+
+@contextmanager
+def inspector_tests_deployed(tmp_test_files, strategy, cwd, playwright_dir):
+    """Copy inspector tests to their real paths, yield, then remove them.
+
+    Keeps the files off disk between iterations so the builder cannot read
+    them. Call without the finally block (manual promotion) when QA passes.
+    """
+    deployed = []
+    try:
+        for _tmp, (dest_path, content) in (tmp_test_files or {}).items():
+            dest = (playwright_dir / dest_path.name
+                    if strategy == "playwright" else dest_path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content)
+            deployed.append(dest)
+        yield deployed
+    finally:
+        for dest in deployed:
+            try:
+                dest.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def phase_qa_evaluation(client, config, eec, strategy, test_command, cwd,
-                        pid, log_dir, sidecar, plan, iteration):
+                        pid, log_dir, sidecar, plan, iteration, tmp_test_files=None):  # noqa: PLR0913
     phase_start(pid, log_dir, "5/8", f"QA EVALUATION iteration {iteration}")
     assert_lock(plan, log_dir, pid)
 
@@ -851,22 +968,39 @@ def phase_qa_evaluation(client, config, eec, strategy, test_command, cwd,
         config.get("playwright_dir", "~/my_claude_automations/playwright")
     ).expanduser()
 
-    # Determine run command — EEC overrides defaults
+    # Determine run command(s) — EEC overrides defaults
     eec_cmd = eec.get("execution", {}).get("test_command")
-    if strategy == "playwright":
-        cmd, test_cwd = ["npm", "test"], playwright_dir
-    elif strategy == "pytest":
-        cmd, test_cwd = eec_cmd or ["pytest", "--tb=short", "-v"], cwd
-    elif strategy == "combined":
-        cmd, test_cwd = eec_cmd or ["pytest", "--tb=short", "-v"], cwd
-    elif test_command:
-        cmd, test_cwd = test_command, cwd
-    else:
-        cmd, test_cwd = eec_cmd or ["pytest", "--tb=short", "-v"], cwd
+    pw_cmd = config.get("playwright_command", ["npx", "playwright", "test"])
 
-    start = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=test_cwd)
-    duration = round(time.time() - start, 1)
+    # Services are started by the caller (main loop) after phase_implement so that
+    # bootstrap scenarios (e.g. new frontend scaffold) work correctly. This function
+    # assumes services are already up when strategy is playwright/combined.
+    with inspector_tests_deployed(tmp_test_files, strategy, cwd, playwright_dir):
+        start = time.time()
+
+        if strategy == "playwright":
+            result = subprocess.run(pw_cmd, capture_output=True, text=True, cwd=cwd)
+        elif strategy == "combined":
+            # Run pytest first, then playwright — both must pass
+            r1 = subprocess.run(
+                eec_cmd or ["pytest", "--tb=short", "-v"],
+                capture_output=True, text=True, cwd=cwd,
+            )
+            r2 = subprocess.run(pw_cmd, capture_output=True, text=True, cwd=cwd)
+            # Merge into a single result-like object
+            class _Combined:
+                returncode = r1.returncode or r2.returncode
+                stdout = f"=== pytest ===\n{r1.stdout}\n=== playwright ===\n{r2.stdout}"
+                stderr = f"=== pytest ===\n{r1.stderr}\n=== playwright ===\n{r2.stderr}"
+            result = _Combined()
+        elif test_command:
+            result = subprocess.run(test_command, capture_output=True, text=True, cwd=cwd)
+        else:
+            cmd = eec_cmd or ["pytest", "--tb=short", "-v"]
+            result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+
+        duration = round(time.time() - start, 1)
+
     exit_code = result.returncode
     stdout = result.stdout[-3000:]
     stderr = result.stderr[-1000:]
@@ -880,7 +1014,8 @@ def phase_qa_evaluation(client, config, eec, strategy, test_command, cwd,
     qa_report = call_claude(client, inspector_model, system,
                             [{"role": "user", "content": prompt}])
 
-    passed = "QA_VERDICT: PASS" in qa_report or exit_code == 0
+    blocked = "QA_VERDICT: BLOCKED" in qa_report
+    passed = not blocked and ("QA_VERDICT: PASS" in qa_report or exit_code == 0)
 
     sidecar.update({
         "phase": f"QA_{iteration}_DONE",
@@ -889,12 +1024,20 @@ def phase_qa_evaluation(client, config, eec, strategy, test_command, cwd,
     })
     write_sidecar(plan, sidecar)
 
-    if passed:
+    if blocked:
+        phase_fail(pid, log_dir, "5/8", f"BLOCKED — precondition failure, iteration not consumed")
+        print(f"\n\033[1;33m⚠  QA BLOCKED — inspector reports a precondition failure:\033[0m")
+        print(f"{qa_report}\n")
+        print("Fix the precondition (install deps, start services) then re-run.")
+        print("This iteration was NOT counted against the limit.")
+    elif passed:
         phase_done(pid, log_dir, "5/8", f"PASSED exit={exit_code} {duration}s")
+        log(log_dir, f"TEST OUTPUT:\n{stdout}")
     else:
         phase_fail(pid, log_dir, "5/8", f"FAILED exit={exit_code} {duration}s")
+        log(log_dir, f"TEST OUTPUT:\n{stdout}\nSTDERR:\n{stderr}")
 
-    return passed, qa_report
+    return passed, qa_report, blocked
 
 
 _COMMIT_PREAMBLE = re.compile(
@@ -1128,7 +1271,18 @@ def phase_deliver(strategy, written_files, passed, qa_report,
                   iteration, max_iterations, scope_type, pid, log_dir, plan):
     phase_start(pid, log_dir, "8/8", "DELIVER")
 
-    result_str = "PASSED ✓" if passed else f"PARTIAL — {iteration}/{max_iterations} iterations"
+    if passed:
+        result_str = "PASS"
+        status_str = "PASS"
+    else:
+        result_str = f"FAIL — exhausted {iteration}/{max_iterations} iterations"
+        first_fail = next(
+            (ln.strip() for ln in (qa_report or "").splitlines()
+             if ln.strip().startswith("FAILED") or "Error" in ln or "ModuleNotFound" in ln),
+            "see run.log for details",
+        )
+        status_str = f"FAIL | {first_fail[:80]}"
+
     banner("FACTORY — DELIVERY COMPLETE")
     print(f"""
 {'=' * 62}
@@ -1139,7 +1293,7 @@ Scope:      {scope_type}
 Iterations: {iteration}/{max_iterations}
 Strategy:   {strategy}
 Files:      {chr(10).join('  ' + f for f in written_files)}
-Git:        committed locally — PUSH PENDING YOUR APPROVAL
+Git:        {"committed locally — PUSH PENDING YOUR APPROVAL" if passed else "NOT committed — tests did not pass"}
 
 QA Report:
 {qa_report}
@@ -1147,8 +1301,8 @@ QA Report:
 """)
 
     _run_state["delivered"] = True
-    archive_plan(plan, log_dir, pid, partial=not passed)
-    write_status(pid, f"COMPLETE | {result_str}")
+    archive_plan(plan, log_dir, pid, _partial=not passed)
+    write_status(pid, status_str)
 
 
 # ---------------------------------------------------------------------------
@@ -1182,6 +1336,8 @@ def main():
     # Extract scope from plan
     plan_content = plan.read_text()
     scope_type = extract_scope_type(plan_content)
+    plan_json = extract_json_block(plan_content) or {}
+    estimated_files = plan_json.get("estimated_files", [])
     max_iterations = SCOPE_ITERATIONS.get(scope_type, config.get("max_iterations", 3))
 
     plan_stem = plan.name.replace("IP_", "").replace(".prd.md", "")
@@ -1241,15 +1397,34 @@ def main():
             agreed_plan, pid, log_dir, sidecar, plan)
         _run_state["feature_tag"] = feature_tag
 
-        test_command = phase_test_plan(
+        _test_plan = phase_test_plan(
             client, config, eec, agreed_plan, strategy, feature_tag,
-            pid, log_dir, sidecar, plan, cwd)[2]
+            pid, log_dir, sidecar, plan, cwd)
+        tmp_test_files, test_command = _test_plan[1], _test_plan[2]
+
+        # Baseline — run existing tests before builder touches anything.
+        # If all fail it's a harness problem, not a builder problem.
+        eec_cmd = eec.get("execution", {}).get("test_command") or ["pytest", "--tb=line", "-q"]
+        baseline_result = subprocess.run(eec_cmd, capture_output=True, text=True, cwd=cwd)
+        baseline_ids = set()
+        for line in baseline_result.stdout.splitlines():
+            if " PASSED" in line:
+                baseline_ids.add(line.split(" PASSED")[0].strip())
+        if baseline_result.returncode != 0 and not baseline_ids:
+            phase_fail(pid, log_dir, "3.5/8", "HARNESS FAILURE — all existing tests fail before builder runs")
+            log(log_dir, f"Baseline stderr:\n{baseline_result.stderr}")
+            release_lock(plan)
+            sys.exit(1)
+        _run_state["baseline_passing"] = list(baseline_ids)
+        log(log_dir, f"Baseline: {len(baseline_ids)} passing tests captured")
 
         passed = False
         qa_report = ""
         feedback = ""
         written_files = []
         iteration = 0
+
+        needs_svc = strategy in ("playwright", "combined")
 
         for iteration in range(1, max_iterations + 1):
             _run_state["iteration"] = iteration
@@ -1258,18 +1433,29 @@ def main():
 
             written_files = phase_implement(
                 client, config, eec, agreed_plan, feedback, scope_type,
-                iteration, pid, log_dir, sidecar, plan, cwd)
+                iteration, pid, log_dir, sidecar, plan, cwd, estimated_files)
             _run_state["written_files"] = written_files
 
             preflight_result = phase_preflight(config, pid, log_dir, sidecar, plan)
             if preflight_result == -1:
                 break
 
-            passed, qa_report = phase_qa_evaluation(
-                client, config, eec, strategy, test_command, cwd,
-                pid, log_dir, sidecar, plan, iteration)
+            # Start playwright services AFTER implement so bootstrap scenarios
+            # (e.g. new frontend scaffold) work — files exist before service start.
+            qa_svc_ctx = (
+                playwright_services_running(config, cwd, log_dir)
+                if needs_svc else contextmanager(lambda: iter([None]))()
+            )
+            with qa_svc_ctx:
+                passed, qa_report, blocked = phase_qa_evaluation(
+                    client, config, eec, strategy, test_command, cwd,
+                    pid, log_dir, sidecar, plan, iteration, tmp_test_files)
             _run_state["passed"] = passed
             _run_state["qa_report"] = qa_report
+
+            if blocked:
+                release_lock(plan)
+                sys.exit(1)
 
             if passed:
                 break
@@ -1281,7 +1467,18 @@ def main():
                 log(log_dir, f"Sanitized feedback:\n{feedback}")
                 phase_done(pid, log_dir, "6/8")
 
-        if is_git:
+        if passed and tmp_test_files:
+            # QA passed — promote inspector tests to permanent paths for git commit.
+            # Write directly (no context manager) so they stay on disk.
+            for _tmp, (dest_path, content) in tmp_test_files.items():
+                dest = (playwright_dir / dest_path.name
+                        if strategy == "playwright" else dest_path)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content)
+                written_files.append(str(dest.relative_to(cwd)))
+                log(log_dir, f"Inspector test promoted: {dest.relative_to(cwd)}")
+
+        if is_git and passed:
             phase_git_commit(
                 agreed_plan, feature_tag, written_files, passed,
                 cwd, config, pid, log_dir, sidecar, plan)

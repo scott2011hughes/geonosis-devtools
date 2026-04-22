@@ -1,0 +1,354 @@
+diff --git a/claude/agents/inspector.md b/claude/agents/inspector.md
+index 6b674dc..6d43b73 100644
+--- a/claude/agents/inspector.md
++++ b/claude/agents/inspector.md
+@@ -29,6 +29,52 @@ something can fail, mark it as a risk and test it.
+ 4. **Report failures** in behavioral terms only — no test internals ever
+    reach the builder
+ 
++## VAULT IMPORT RULE — NON-NEGOTIABLE
++
++`services/shared/resources/config.py` reads a vault file **at import time** (module level).
++Any import that transitively reaches it will cause pytest to fail at collection with 0 tests collected.
++
++**The chain that kills collection:**
++```
++from shared.resources.deploy import ...       ← triggers →
++  shared/resources/task.py                    ← triggers →
++    shared/resources/mongodb.py               ← triggers →
++      shared/resources/config.py              ← READS VAULT → FileNotFoundError
++```
++
++### The rule is simple:
++
++**NEVER put `from shared.resources.*` at the top of a test file.**
++
++Import from `shared.resources.*` only inside fixture bodies or test function bodies — never at module level.
++
++```python
++# ❌ FORBIDDEN — kills collection
++from shared.resources.deploy import POST_DEPLOY_TASK
++
++# ✅ CORRECT — import inside test function
++def test_something():
++    from shared.resources.deploy import POST_DEPLOY_TASK
++    assert POST_DEPLOY_TASK == "tasks.post_deploy"
++
++# ✅ ALSO CORRECT — import inside fixture
++@pytest.fixture
++def post_deploy_task():
++    from shared.resources.deploy import POST_DEPLOY_TASK
++    return POST_DEPLOY_TASK
++```
++
++### Mandatory self-check before outputting any test file
++
++Before writing your JSON output, scan every test file you have written.
++For each file, confirm:
++
++- [ ] No `from shared.resources.*` appears at the top of the file (outside functions/fixtures)
++- [ ] No `from shared.models.*` that transitively imports `shared.resources.config`
++- [ ] `from shared.models.talosflux import ...` and `from shared.models.user import ...` are safe (they do NOT trigger vault)
++
++If any test file fails this check, fix it before outputting.
++
+ ## Before Writing Tests
+ 
+ Read the existing codebase for:
+diff --git a/claude/agents/intake.md b/claude/agents/intake.md
+index 4853a13..1163c79 100644
+--- a/claude/agents/intake.md
++++ b/claude/agents/intake.md
+@@ -6,6 +6,7 @@ tools:
+   - Read
+   - Bash
+   - Glob
++  - mcp__jira__get_jira_issue
+ ---
+ 
+ You are a spec intake agent. Your job is to fetch or read a spec, score it
+@@ -19,12 +20,12 @@ Detect the source from the input:
+ 
+ | Input format | Action |
+ |---|---|
+-| `staging/github/NEW_*.prd.md` | read file directly |
+-| `staging/gitlab/NEW_*.prd.md` | read file directly |
+-| `staging/jira/NEW_*.prd.md` | read file directly |
+-| `owner/repo#42` | `gh issue view 42 --repo owner/repo --comments` |
+-| `group/repo#17` | `glab issue view 17 --repo group/repo` |
+-| `PROJ-123` or `PROJECT-123` | `jira issue view PROJECT-123` |
++| `staging/github/NEW_*.prd.md` | Read file directly using the Read tool |
++| `staging/gitlab/NEW_*.prd.md` | Read file directly using the Read tool |
++| `staging/jira/NEW_*.prd.md` | Read file directly using the Read tool |
++| `owner/repo#42` | Content is provided in the prompt by the invoking command |
++| `group/repo#17` | Content is provided in the prompt by the invoking command |
++| `PROJ-123` or `PROJECT-123` | Use `mcp__jira__get_jira_issue` with `issueKey` — do NOT attempt CLI commands (`jira`, `gh`, `glab` are not available) |
+ 
+ Store the full content as `raw_spec`. Detect and store `repo_target` from
+ the file path subdirectory or issue source for downstream use.
+diff --git a/claude/agents/multi_agent/README.md b/claude/agents/multi_agent/README.md
+index b12d522..2c88598 100644
+--- a/claude/agents/multi_agent/README.md
++++ b/claude/agents/multi_agent/README.md
+@@ -5,25 +5,103 @@ Orchestrates a plan → implement → QA feedback loop using three Claude Code n
+ Lives at: `~/my_claude_automations/agents/` (symlinked into `.claude/agents/` of any repo via `link.sh`)
+ 
+ ## Flow
+-```mermaid
+-flowchart TD
+-    A[User Prompt] --> B[Orchestrator\n• Manages all state\n• Controls what each agent sees\n• Drives the loop]
+-    B -->|Phase 1 – Plan Negotiation| C[Coder\nSees: User req\nProduces: PLAN_AGREED]
+-    C -->|agreed plan| D[Orchestrator\nstores plan; QA never\nheard Phase 1 at all]
+-    D -->|Phase 2 – Test Plan private| E[QA Agent\nSees: Plan only\nProduces: test files on disk]
+-    E -->|Phase 3 – Loop 3-5x| F[Coder\nSees: Plan + Sanitized feedback\nno test details]
+-    F -->|writes files| G[Run Tests\nplaywright/pytest/etc]
+-    G --> H[QA Agent\nSees: Test output + Test plan]
+-    H -->|No – sanitized feedback strips test names/paths/assertions| F
+-    H -->|Yes – passed| I[Git Commit\nif git repo]
+-    I --> J[Final Code\n+ QA Report]
+-    J --> K[User]
++
++```
++              ┌─────────────────┐
++              │   User Prompt   │
++              └────────┬────────┘
++                       │
++                       ▼
++         ┌─────────────────────────┐
++         │       Orchestrator      │
++         │  • Manages all state    │
++         │  • Controls what each   │
++         │    agent sees           │
++         │  • Drives the loop      │
++         └────────────┬────────────┘
++                      │
++                      │ Phase 1 — Plan Negotiation
++                      ▼
++              ┌───────────────┐
++              │     Coder     │
++              │  Sees:        │
++              │  • User req   │
++              │               │
++              │  Produces:    │
++              │  PLAN_AGREED  │
++              └───────┬───────┘
++                      │ agreed plan
++                      ▼
++         ┌─────────────────────────┐
++         │       Orchestrator      │
++         │  stores plan; QA never  │
++         │  heard Phase 1 at all   │
++         └────────────┬────────────┘
++                      │
++                      │ Phase 2 — Test Plan (private)
++                      ▼
++              ┌───────────────┐
++              │   QA Agent    │
++              │  Sees:        │
++              │  • Plan only  │
++              │               │
++              │  Produces:    │
++              │  test files   │
++              │  (on disk)    │
++              └───────┬───────┘
++                      │
++                      │ Phase 3 — Loop (3–5×)
++                      │ ◄────────────────────────────┐
++                      ▼                              │
++              ┌───────────────┐                      │
++              │     Coder     │                      │
++              │  Sees:        │                      │
++              │  • Plan       │                      │
++              │  • Sanitized  │                      │
++              │    feedback   │                      │
++              │    (no test   │                      │
++              │    details)   │                      │
++              └───────┬───────┘                      │
++                      │ writes files                 │
++                      ▼                              │
++              ┌───────────────┐                      │
++              │  Run Tests    │                      │
++              │  (playwright/ │                      │
++              │   pytest/etc) │                      │
++              └───────┬───────┘                      │
++                      │                              │
++                      ▼                              │
++              ┌───────────────┐                      │
++              │   QA Agent    │   No — sanitized ────┘
++              │  Sees:        ├──────────────────────►
++              │  • Test output│   feedback (strips
++              │  • Test plan  │   test names/paths/
++              │               │   assertions)
++              └───────┬───────┘
++                      │ Yes — passed
++                      ▼
++              ┌───────────────┐
++              │  Git Commit   │
++              │  (if git repo)│
++              └───────┬───────┘
++                      │
++                      ▼
++              ┌───────────────┐
++              │  Final Code   │
++              │  + QA Report  │
++              └───────┬───────┘
++                      │
++                      ▼
++                  ┌───────┐
++                  │  User │
++                  └───────┘
+ ```
+ 
+ ## Usage
+ 
+ From any project directory, invoke the orchestrator agent:
+-```bash
++
++```
+ # In Claude Code chat, mention the agent by name:
+ @acme_coding_agent Add a users search endpoint that filters by name and email
+ ```
+@@ -48,7 +126,7 @@ Note: `/acme_coding_agent` (slash prefix) is NOT correct — that syntax is for
+ 
+ | Agent | File | Model | Role |
+ |-------|------|-------|------|
+-| acme_coding_agent | `agents/acme_coding_agent.md` | claude-opus-4-6 | State machine driver, spawns sub-agents |
++| acme_coding_agent | `agents/acme_coding_agent.md` | claude-opus-4-6 | State machine driver, spawns coder + QA |
+ | coder | `agents/coder.md` | claude-sonnet-4-6 | Explores codebase, writes implementation files |
+ | qa | `agents/qa.md` | claude-sonnet-4-6 | Creates test plan, evaluates results |
+ 
+@@ -73,22 +151,22 @@ Note: `/acme_coding_agent` (slash prefix) is NOT correct — that syntax is for
+ 
+ ## Context Isolation
+ 
+-The Coder **never** sees the QA test plan. The orchestrator sanitizes QA feedback to strip test
+-function names, file paths, and assertions before any feedback reaches the Coder. Only behavioral
+-failure descriptions are forwarded.
++The Coder **never** sees the QA test plan. The orchestrator sanitizes QA feedback to strip test function names,
++file paths, and assertions before any feedback reaches the Coder. Only behavioral failure descriptions are forwarded.
+ 
+ ## Git Behaviour
+ 
+ - Detects git at startup via `git rev-parse`
+ - If not a git repo (e.g. service_desk platform): commit step silently skipped
+ - Commits to the **current branch** — no branch creation, no PR
+-- Commit message format: `` `feat: <plan summary> [passing|partial]` ``
++- Commit message format: `feat: <plan summary> [passing|partial]`
+ 
+ ## Setup
+ 
+ The agents are automatically available in any repo that has been linked:
++
+ ```bash
+ ~/my_claude_automations/link.sh /path/to/your/repo
+ ```
+ 
+-This symlinks `~/my_claude_automations/agents/` into `.claude/agents/` of the target repo.
+\ No newline at end of file
++This symlinks `~/my_claude_automations/agents/` into `.claude/agents/` of the target repo.
+diff --git a/claude/hooks/stop-hook.sh b/claude/hooks/stop-hook.sh
+index bcc0385..29e3c64 100644
+--- a/claude/hooks/stop-hook.sh
++++ b/claude/hooks/stop-hook.sh
+@@ -2,17 +2,16 @@
+ # Runs when Claude stops responding.
+ # 1. Reminds about uncommitted changes.
+ # 2. Auto-pushes if there are commits ahead of remote.
+-
++
+ # Uncommitted changes reminder
+ if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+     echo '{"systemMessage":"Uncommitted changes pending — remember to commit."}'
+ fi
+-
++
+ # Auto-push if on a named branch with commits ahead of remote
+ BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+ if [ -n "$BRANCH" ] && [ "$BRANCH" != "HEAD" ]; then
+     git push origin "$BRANCH" >/dev/null 2>&1 || true
+ fi
+-
++
+ exit 0
+-
+\ No newline at end of file
+diff --git a/claude/hooks/vscode-diff.sh b/claude/hooks/vscode-diff.sh
+index d7b5bf3..178d55a 100644
+--- a/claude/hooks/vscode-diff.sh
++++ b/claude/hooks/vscode-diff.sh
+@@ -1,23 +1,22 @@
+ #!/bin/bash
+ # Opens a VS Code diff (HEAD vs working file) after Claude edits a file.
+ # Receives Claude hook JSON on stdin.
+-
++
+ FILE=$(jq -r '.tool_input.file_path // empty')
+ [ -z "$FILE" ] && exit 0
+-
++
+ REPO=$(git -C "$(dirname "$FILE")" rev-parse --show-toplevel 2>/dev/null)
+ REL=$(realpath --relative-to="$REPO" "$FILE" 2>/dev/null)
+-
++
+ # Use the most recently installed VS Code server binary (survives updates)
+ CODE=$(ls -t /home/hughsc2/.vscode-server/cli/servers/Stable-*/server/bin/remote-cli/code 2>/dev/null | head -1)
+ [ -z "$CODE" ] && exit 0
+-
++
+ HASH=$(echo "$FILE" | md5sum | cut -c1-8)
+ TMPFILE="/tmp/claude_diff_${HASH}_$(basename "$FILE")"
+-
++
+ git -C "$REPO" show "HEAD:$REL" > "$TMPFILE" 2>/dev/null \
+-    && "$CODE" --no-wait --diff "$TMPFILE" "$FILE" 2>/dev/null \
+-    || "$CODE" --no-wait "$FILE" 2>/dev/null
+-
++  && "$CODE" --no-wait --diff "$TMPFILE" "$FILE" 2>/dev/null \
++  || "$CODE" --no-wait "$FILE" 2>/dev/null
++
+ exit 0
+-
+\ No newline at end of file
+diff --git a/claude/skills/playwright-cli/SKILL.md b/claude/skills/playwright-cli/SKILL.md
+index 0fdafbe..6aaef84 100644
+--- a/claude/skills/playwright-cli/SKILL.md
++++ b/claude/skills/playwright-cli/SKILL.md
+@@ -160,21 +160,6 @@ playwright-cli video-chapter "Chapter Title" --description="Details" --duration=
+ playwright-cli video-stop
+ ```
+ 
+-## Raw output
+-
+-The global `--raw` option strips page status, generated code, and snapshot sections from the output, returning only the result value. Use it to pipe command output into other tools. Commands that don't produce output return nothing.
+-
+-```bash
+-playwright-cli --raw eval "JSON.stringify(performance.timing)" | jq '.loadEventEnd - .navigationStart'
+-playwright-cli --raw eval "JSON.stringify([...document.querySelectorAll('a')].map(a => a.href))" > links.json
+-playwright-cli --raw snapshot > before.yml
+-playwright-cli click e5
+-playwright-cli --raw snapshot > after.yml
+-diff before.yml after.yml
+-TOKEN=$(playwright-cli --raw cookie-get session_id)
+-playwright-cli --raw localstorage-get theme
+-```
+-
+ ## Open parameters
+ ```bash
+ # Use specific browser when creating session
+@@ -182,15 +167,14 @@ playwright-cli open --browser=chrome
+ playwright-cli open --browser=firefox
+ playwright-cli open --browser=webkit
+ playwright-cli open --browser=msedge
++# Connect to browser via extension
++playwright-cli open --extension
+ 
+ # Use persistent profile (by default profile is in-memory)
+ playwright-cli open --persistent
+ # Use persistent profile with custom directory
+ playwright-cli open --profile=/path/to/profile
+ 
+-# Connect to browser via extension
+-playwright-cli attach --extension
+-
+ # Start with config file
+ playwright-cli open --config=my-config.json

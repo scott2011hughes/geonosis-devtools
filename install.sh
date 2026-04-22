@@ -8,7 +8,7 @@
 #   --link:  symlinks instead — updates to geonosis-devtools propagate automatically.
 #            Use this only if you own both repos and want live updates.
 #
-# Safe to re-run — skips anything that already exists.
+# Safe to re-run — overwrites existing files, skips existing directories.
 
 set -euo pipefail
 
@@ -46,25 +46,34 @@ echo "  mode:    $( $USE_LINKS && echo 'symlink (--link)' || echo 'copy (default
 echo ""
 
 # --------------------------------------------------------------------------
-# Install helper — copy or symlink a source into dest, skip if dest exists
+# Install helper — copy or symlink a source into dest
+#   directories: skip if dest exists (mkdir -p is safe)
+#   files:       always overwrite (enables re-run as update)
+#   --link mode: keeps old skip-if-exists behavior (symlinks are already live)
 # --------------------------------------------------------------------------
 
 install_item() {
   local src="$1" dest="$2" label="$3"
-  if [[ -L "$dest" || -e "$dest" ]]; then
-    echo "  [skip]    $label — already exists"
-    return
-  fi
   if $USE_LINKS; then
+    if [[ -L "$dest" || -e "$dest" ]]; then
+      echo "  [skip]    $label — already linked"
+      return
+    fi
     ln -s "$src" "$dest"
     echo "  [link]    $label"
+    return
+  fi
+  if [[ -d "$src" ]]; then
+    local existed=false
+    [[ -d "$dest" ]] && existed=true
+    mkdir -p "$dest"
+    cp -rf "$src/." "$dest/"
+    $existed && echo "  [update]  $label" || echo "  [copy]    $label"
   else
-    if [[ -d "$src" ]]; then
-      cp -r "$src" "$dest"
-    else
-      cp "$src" "$dest"
-    fi
-    echo "  [copy]    $label"
+    local existed=false
+    [[ -e "$dest" ]] && existed=true
+    cp "$src" "$dest"
+    $existed && echo "  [update]  $label" || echo "  [copy]    $label"
   fi
 }
 

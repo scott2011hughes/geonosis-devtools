@@ -46,9 +46,12 @@ Score each field as PRESENT, PARTIAL, or MISSING:
 | `out_of_scope` | at least one explicit exclusion |
 | `definition_of_done` | exit condition stated |
 | `scope_type` | one of: `surgical_fix`, `feature_add`, `refactor`, `new_domain` |
+| `test_strategy` | one of: `pytest`, `playwright`, `combined` |
 | `open_questions` | field present — empty = ready, non-empty = blocked |
 
 Scoring `scope_type`: derive it from reading `solution` and `acceptance_criteria` — do not ask the requester. `surgical_fix` = minimal targeted change to existing behavior. `feature_add` = net-new capability in existing files. `refactor` = internal restructuring, no new behavior. `new_domain` = new module, service, or cross-cutting concern. If ambiguous, score as PARTIAL.
+
+Scoring `test_strategy`: `pytest` = backend-only, no UI involved. `playwright` = UI/frontend only, API mocked via `page.route()`. `combined` = both backend pytest and frontend playwright tests needed. Derive from the touch radius — if frontend files are in scope, include playwright.
 
 Never infer or assume a field is present. Only score what is explicitly
 written in the spec.
@@ -91,6 +94,7 @@ the final PRD written to staging/.
   "out_of_scope": [],
   "definition_of_done": [],
   "scope_type": "surgical_fix | feature_add | refactor | new_domain",
+  "test_strategy": "pytest | playwright | combined",
   "open_questions": []
 }
 ```

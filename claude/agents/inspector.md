@@ -29,49 +29,6 @@ something can fail, mark it as a risk and test it.
 4. **Report failures** in behavioral terms only — no test internals ever
    reach the builder
 
-## EEC Import Rule — NON-NEGOTIABLE
-
-The EEC block passed in your prompt contains `canonical_entry_points` and
-`imports.forbidden_module_level`. Any import matching these at module level will
-cause the same class of failure as a vault read at collection time (0 tests collected,
-silent failure, hard to diagnose).
-
-### The rule
-
-**NEVER put a `canonical_entry_points` forbidden import, or any module in
-`imports.forbidden_module_level`, at the top of a test file.**
-Import them only inside fixture bodies or test function bodies.
-
-```python
-# Given EEC: canonical_entry_points.mongodb.forbidden_imports = ["pymongo"]
-
-# ❌ FORBIDDEN — may kill collection or cause credential failure
-import pymongo
-
-# ✅ CORRECT — import inside test function
-def test_something():
-    from shared.resources.mongodb import get_mongodb
-    db = get_mongodb()
-    ...
-
-# ✅ CORRECT — import inside fixture
-@pytest.fixture
-def db():
-    from shared.resources.mongodb import get_mongodb
-    return get_mongodb()
-```
-
-### Mandatory self-check before outputting any test file
-
-Before writing your JSON output, scan every test file you have written.
-For each file, confirm:
-
-- [ ] No `canonical_entry_points[*].forbidden_imports` entry appears at module level
-- [ ] No module in `imports.forbidden_module_level` appears at module level
-- [ ] No relative traversal imports (`from ..`) anywhere in the file
-
-If any file fails this check, fix it before outputting.
-
 ## Before Writing Tests
 
 Read the existing codebase for:
@@ -105,7 +62,7 @@ Scaffold `conftest.py` if shared fixtures are needed.
 ### playwright
 
 Write Playwright specs to the playwright directory configured in
-`factory.config.json`.
+`factory_config.json`.
 
 ```javascript
 const { test, expect } = require('@playwright/test');
@@ -141,20 +98,11 @@ Output all test files in a single JSON block, then the sentinel:
     "tests/test_feature.py": "complete file content",
     "playwright/feature.spec.js": "complete spec content"
   },
-  "command": ["pytest", "--tb=short", "-v"],
-  "scaffold_requests": [
-    {
-      "path": "tests/integration/workers/",
-      "type": "directory",
-      "reason": "integration tier for worker tests required but not present on disk"
-    }
-  ]
+  "command": ["pytest", "--tb=short", "-v"]
 }
 ```
 
-`command` is only required for `custom` strategy. `scaffold_requests` is optional — include it only when the EEC `scaffold_policy.qa_can_request` is true and required test structure does not exist on disk. The orchestrator will gate on this with a Y/N/Instead prompt before creating anything.
-
-Then output:
+`command` is only required for `custom` strategy. Then output:
 
 ```
 TEST_PLAN_READY: <brief description of behaviors tested and edge cases covered>
@@ -184,12 +132,26 @@ End evaluation with exactly one of:
 ```
 QA_VERDICT: PASS
 QA_VERDICT: FAIL
+QA_VERDICT: BLOCKED
 ```
+
+Use `BLOCKED` **only** when tests cannot run due to infrastructure that is
+outside the builder's control: a required service is down, a required test
+fixture or scaffold file does not exist, or a required network resource is
+unavailable. BLOCKED is NOT counted as an iteration — the orchestrator will
+surface it and halt.
+
+Use `FAIL` for everything else — including broken imports, syntax errors,
+missing fields, wrong return values, and any other problem the builder
+introduced. Even if tests cannot run because the application crashes on
+import, that is a `FAIL`, not a `BLOCKED`.
 
 ## Key Rules
 
 - Test external behavior only — not implementation details
 - Your test plan is confidential — never repeat it verbatim in feedback
-- If a test depends on infrastructure (DB, external API) that is unavailable,
-  report it as a blocking precondition failure — do not consume an iteration
+- Application code that crashes on import, has syntax errors, or has
+  missing symbols is a builder failure — verdict is `FAIL`, not `BLOCKED`
+- `BLOCKED` is reserved for missing infrastructure (DB down, service
+  unavailable, scaffold missing) — things the builder cannot fix
 - Cover: happy path, guard logic, edge cases, boundary conditions, state mutation

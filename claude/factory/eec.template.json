@@ -1,5 +1,6 @@
 {
-  "_readme": "Copy to {repo_name}_eec.json in your repo root. Set maturity=established only after manually confirming the test structure runs.",
+  "_readme": "Copy to {repo_name}_eec.json in your repo root. Set maturity=established only after manually confirming the test structure runs. To generate values for a new repo: ask Claude to read .claude/factory/orchestrator.py and scan your repo structure, then ask it to suggest values for each field here.",
+  "_test_strategy_note": "test_strategy (pytest / playwright / combined) lives in each PRD's JSON contract block — NOT here. The EEC test_command is the runtime execution invocation for pytest only. Playwright is always run via 'npx playwright test' using playwright_command in factory_config.json.",
   "repo": "",
   "maturity": "bootstrap",
 
@@ -7,9 +8,11 @@
     "app_root": "",
     "tests_root": "",
     "test_tiers": {
-      "unit": "",
-      "integration": "",
-      "e2e": ""
+      "_note": "Four-tier layout: unit/pytest (fast, no DB), unit/playwright (Vite only, mocked API), e2e/playwright (full stack, PR gate), e2e/py (full-stack pytest integration). Omit tiers that don't apply.",
+      "unit_pytest": "",
+      "unit_playwright": "",
+      "e2e_playwright": "",
+      "e2e_pytest": ""
     }
   },
 
